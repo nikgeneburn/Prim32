@@ -2,6 +2,8 @@
 
 **One primitive. Thirty-two bytes. Straight to the GPU.**
 
+**Documentation: [prim32.mintlify.site](https://prim32.mintlify.site/)**
+
 Prim32 is a raw, high-throughput immediate-mode GUI and 2D rendering framework built specifically for Direct3D 12.
 
 It keeps the familiar programming model of libraries such as Dear ImGui while replacing the traditional CPU-generated vertex and index pipeline with a compact GPU-driven primitive stream.
@@ -228,6 +230,17 @@ The included profiler provides:
 - RAM and VRAM drift estimates
 - Clipboard dumps
 - CSV logging
+
+## Documentation
+
+Full documentation lives at **[prim32.mintlify.site](https://prim32.mintlify.site/)**:
+
+- [Quickstart](https://prim32.mintlify.site/quickstart) — build and run the benchmark in two minutes
+- [Integration](https://prim32.mintlify.site/integration) — wire Prim32 into an existing D3D12 frame loop
+- [Architecture](https://prim32.mintlify.site/concepts/architecture) — the 32-byte primitive model, zero-copy submission, vertex pulling
+- [Layers & caching](https://prim32.mintlify.site/concepts/layers-and-caching) — background/foreground layers and retained layers that move for free
+- [Performance](https://prim32.mintlify.site/concepts/performance) — measured numbers, the bottleneck walls, the SIMD bulk-emit pattern
+- [API reference](https://prim32.mintlify.site/api/drawlist) — [DrawList](https://prim32.mintlify.site/api/drawlist), [images & fonts](https://prim32.mintlify.site/api/images-and-fonts), [widgets & windows](https://prim32.mintlify.site/api/widgets-and-windows), [D3D12 backend](https://prim32.mintlify.site/api/backend-d3d12), [profiler](https://prim32.mintlify.site/api/profiler)
 
 ## Requirements
 
