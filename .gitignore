@@ -1,0 +1,11 @@
+/build/
+/bin/
+/out/
+
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+prim32_profile.csv
