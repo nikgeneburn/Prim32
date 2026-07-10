@@ -256,7 +256,7 @@ The current Windows implementation uses:
 - D3D12
 - DXGI
 - D3DCompiler
-- GDI for font baking
+- GDI for font rasterization (FreeType optional)
 - WIC for image decoding
 - PDH for per-process GPU utilization
 - PSAPI for process memory statistics
@@ -546,7 +546,16 @@ Image handles are generational. A stale handle will not resolve to a newly alloc
 
 Fonts can be loaded from disk or memory.
 
-The current implementation supports TTF, OTF, and TTC font data through the Windows font APIs.
+The current implementation supports TTF, OTF, and TTC font data.
+
+Text is UTF-8 with a dynamic glyph cache: glyphs of any script (CJK, Cyrillic, icon fonts in the Private Use Area, and so on) rasterize on first use, pack into atlas pages, and upload incrementally. Nothing is pre-baked.
+
+Two rasterizers are available:
+
+- GDI (default, zero dependencies) covers the entire Basic Multilingual Plane
+- FreeType (optional: `PRIM32_WITH_FREETYPE` in CMake, or define `PRIM32_HAS_FREETYPE` and link `freetype`) covers every Unicode plane
+
+Icon fonts are ordinary fonts: load one (for example Segoe MDL2 Assets) and draw PUA codepoints, using `prim32::EncodeUtf8(0xE713, buf)` to build the UTF-8 string.
 
 ### Load from disk
 
@@ -1158,7 +1167,8 @@ Known limitations include:
 
 - Windows-only backend
 - D3D12-only renderer
-- Latin-1 glyph range in the default font baker
+- GDI rasterizer limited to the Basic Multilingual Plane (FreeType covers all planes)
+- No font-fallback chains (missing glyphs render a notdef box)
 - No HarfBuzz shaping
 - No bidirectional text
 - No complex-script shaping
@@ -1183,9 +1193,8 @@ The absence of arbitrary triangles is deliberate. Prim32 is optimized around fix
 
 Potential future improvements include:
 
-- UTF-8 decoding and full Unicode glyph ranges
-- FreeType or stb_truetype font rasterization
 - HarfBuzz text shaping
+- Font-fallback chains
 - Ellipsis and truncation
 - Text input
 - Multi-line editing

@@ -19,6 +19,7 @@ cl /nologo /std:c++17 /O2 /Oi /Ot /GL /fp:fast /EHs-c- /GR- /DNDEBUG /DUNICODE /
    /I"%ROOT%\src" ^
    "%ROOT%\src\prim32.cpp" ^
    "%ROOT%\src\prim32_resources.cpp" ^
+   "%ROOT%\src\prim32_freetype.cpp" ^
    "%ROOT%\src\backends\prim32_dx12.cpp" ^
    "%ROOT%\src\profiler\p32prof.cpp" ^
    "%ROOT%\src\profiler\p32prof_ui.cpp" ^

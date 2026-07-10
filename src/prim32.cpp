@@ -66,109 +66,6 @@ void Style::Dark() {
     colors[ZC_ProgressFill]    = COL32(74, 144, 110, 255);
 }
 
-// ------------------------------------------------------------ font baking (GDI)
-// GGO_GRAY8_BITMAP gives 65-level antialiased coverage with zero dependencies.
-bool Prim32BakeFont(FontAtlas* fa, const wchar_t* face, float sizePx, bool kerning) {
-    HDC dc = CreateCompatibleDC(nullptr);
-    if (!dc) return false;
-    HFONT font = CreateFontW(-(int)(sizePx + 0.5f), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
-    if (!font) { DeleteDC(dc); return false; }
-    HGDIOBJ old = SelectObject(dc, font);
-
-    TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
-    fa->ascent = (float)tm.tmAscent; fa->descent = (float)tm.tmDescent;
-    fa->lineHeight = (float)(tm.tmHeight + tm.tmExternalLeading);
-    fa->size = sizePx;
-
-    const MAT2 mat = { {0,1},{0,0},{0,0},{0,1} };
-    struct Tmp { uint8_t* bits; int w, h, ox, oy; float adv; };
-    Tmp tmp[224] = {};
-    uint64_t area = 0;
-
-    for (int i = 0; i < 224; i++) {
-        wchar_t ch = (wchar_t)(32 + i);
-        GLYPHMETRICS gm = {};
-        DWORD sz = GetGlyphOutlineW(dc, ch, GGO_GRAY8_BITMAP, &gm, 0, nullptr, &mat);
-        if (sz == GDI_ERROR) {  // unsupported codepoint -> zero glyph
-            tmp[i].adv = sizePx * 0.5f;
-            continue;
-        }
-        tmp[i].adv = (float)gm.gmCellIncX;
-        tmp[i].w = (int)gm.gmBlackBoxX; tmp[i].h = (int)gm.gmBlackBoxY;
-        tmp[i].ox = gm.gmptGlyphOrigin.x; tmp[i].oy = gm.gmptGlyphOrigin.y;
-        if (sz && tmp[i].w > 0 && tmp[i].h > 0) {
-            tmp[i].bits = (uint8_t*)malloc(sz);
-            GLYPHMETRICS gm2;
-            if (GetGlyphOutlineW(dc, ch, GGO_GRAY8_BITMAP, &gm2, sz, tmp[i].bits, &mat) == GDI_ERROR) {
-                free(tmp[i].bits); tmp[i].bits = nullptr;
-            }
-            area += (uint64_t)(tmp[i].w + 2) * (tmp[i].h + 2);
-        }
-    }
-
-    int aw = 128;
-    while ((uint64_t)aw * aw < area * 2 && aw < 4096) aw <<= 1;   // 2x slack for shelf waste
-    int ah = aw;
-    fa->pixels = (uint8_t*)calloc(1, (size_t)aw * ah);
-    fa->width = aw; fa->height = ah;
-    fa->pixels[0] = 255;                                          // white pixel at (0,0)
-
-    int px = 2, py = 2, shelfH = 0;
-    for (int i = 0; i < 224; i++) {
-        Glyph* gl = &fa->glyphs[i];
-        if (!tmp[i].bits) { gl->advance = tmp[i].adv; continue; } // blank glyph
-        int w = tmp[i].w, h = tmp[i].h;
-        if (px + w + 2 > aw) { px = 2; py += shelfH + 2; shelfH = 0; }
-        if (h > shelfH) shelfH = h;
-        if (py + h + 2 > ah) { free(tmp[i].bits); gl->advance = tmp[i].adv; continue; } // full
-        int pitch = (w + 3) & ~3;                                 // GGO rows are DWORD aligned
-        for (int r = 0; r < h; r++) {
-            uint8_t* dst = fa->pixels + (size_t)(py + r) * aw + px;
-            uint8_t* src = tmp[i].bits + (size_t)r * pitch;
-            for (int x = 0; x < w; x++) { uint32_t v = src[x] * 255u / 64u; dst[x] = v > 255 ? 255 : (uint8_t)v; }
-        }
-        gl->uv0 = PackUV((float)px / aw, (float)py / ah);
-        gl->uv1 = PackUV((float)(px + w) / aw, (float)(py + h) / ah);
-        gl->x0 = (float)tmp[i].ox;               // pen-relative, y from baseline
-        gl->y0 = (float)-tmp[i].oy;
-        gl->x1 = gl->x0 + w; gl->y1 = gl->y0 + h;
-        gl->advance = tmp[i].adv;
-        px += w + 2;
-        free(tmp[i].bits);
-    }
-
-    fa->kernCount = 0; fa->kernKeys = nullptr; fa->kernVals = nullptr;
-    if (kerning) {
-        DWORD n = GetKerningPairsW(dc, 0, nullptr);
-        if (n && n != GDI_ERROR) {
-            KERNINGPAIR* kp = (KERNINGPAIR*)malloc(n * sizeof(KERNINGPAIR));
-            n = GetKerningPairsW(dc, n, kp);
-            if (n && n != GDI_ERROR) {
-                fa->kernKeys = (uint32_t*)malloc(n * 4);
-                fa->kernVals = (float*)malloc(n * 4);
-                uint32_t m = 0;
-                for (DWORD k = 0; k < n; k++)
-                    if (kp[k].iKernAmount && kp[k].wFirst < 256 && kp[k].wSecond < 256) {
-                        fa->kernKeys[m] = ((uint32_t)kp[k].wFirst << 16) | kp[k].wSecond;
-                        fa->kernVals[m] = (float)kp[k].iKernAmount; m++;
-                    }
-                fa->kernCount = m;
-                // insertion sort by key (GDI returns them nearly sorted)
-                for (uint32_t a = 1; a < m; a++) {
-                    uint32_t key = fa->kernKeys[a]; float val = fa->kernVals[a]; uint32_t b = a;
-                    while (b && fa->kernKeys[b - 1] > key) { fa->kernKeys[b] = fa->kernKeys[b-1]; fa->kernVals[b] = fa->kernVals[b-1]; b--; }
-                    fa->kernKeys[b] = key; fa->kernVals[b] = val;
-                }
-            }
-            free(kp);
-        }
-    }
-    SelectObject(dc, old); DeleteObject(font); DeleteDC(dc);
-    return true;
-}
-
 // ===== PRIM32_PURE_TEXT_BEGIN (no OS deps; extracted by the native tests) =====
 static inline float Kern(const FontAtlas* fa, uint32_t a, uint32_t b) {
     if (!fa->kernCount) return 0.0f;
@@ -177,45 +74,133 @@ static inline float Kern(const FontAtlas* fa, uint32_t a, uint32_t b) {
     return (lo < fa->kernCount && fa->kernKeys[lo] == key) ? fa->kernVals[lo] : 0.0f;
 }
 
+// UTF-8 decode, one codepoint. Advances *s. Malformed bytes -> U+FFFD.
+uint32_t Prim32Utf8Next(const char** s, const char* end) {
+    const uint8_t* p = (const uint8_t*)*s;
+    uint8_t c = *p;
+    if (c < 0x80) { *s += 1; return c; }
+    if ((c >> 5) == 0x6 && *s + 1 < end && (p[1] & 0xC0) == 0x80) {
+        *s += 2; return ((uint32_t)(c & 0x1F) << 6) | (p[1] & 0x3F);
+    }
+    if ((c >> 4) == 0xE && *s + 2 < end && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+        *s += 3; return ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    }
+    if ((c >> 3) == 0x1E && *s + 3 < end && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+        *s += 4; return ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12)
+                      | ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+    }
+    *s += 1;
+    return 0xFFFD;
+}
+
+// cp -> glyph pool index (0 = miss). ASCII takes the direct array.
+uint32_t Prim32CacheFind(const FontAtlas* fa, uint32_t cp) {
+    if (cp >= 32 && cp < 127) return fa->asciiMap[cp - 32];
+    if (!fa->cpCap) return 0;
+    uint32_t h = (cp * 2654435761u) & (fa->cpCap - 1);
+    for (;;) {
+        uint32_t k = fa->cpKeys[h];
+        if (k == cp) return fa->cpVals[h];
+        if (k == 0xFFFFFFFFu) return 0;
+        h = (h + 1) & (fa->cpCap - 1);
+    }
+}
+
+// insert cp -> pool index (grows + rehashes at 70% load)
+bool Prim32CacheInsert(FontAtlas* fa, uint32_t cp, uint32_t glyphIdx) {
+    if (cp >= 32 && cp < 127) { fa->asciiMap[cp - 32] = glyphIdx; return true; }
+    if (fa->cpCount * 10 >= fa->cpCap * 7) {
+        uint32_t newCap = fa->cpCap ? fa->cpCap * 2 : 256;
+        uint32_t* nk = (uint32_t*)malloc(newCap * 4);
+        uint32_t* nv = (uint32_t*)malloc(newCap * 4);
+        if (!nk || !nv) { free(nk); free(nv); return false; }
+        memset(nk, 0xFF, newCap * 4);
+        for (uint32_t i = 0; i < fa->cpCap; i++) {
+            if (fa->cpKeys[i] == 0xFFFFFFFFu) continue;
+            uint32_t h = (fa->cpKeys[i] * 2654435761u) & (newCap - 1);
+            while (nk[h] != 0xFFFFFFFFu) h = (h + 1) & (newCap - 1);
+            nk[h] = fa->cpKeys[i]; nv[h] = fa->cpVals[i];
+        }
+        free(fa->cpKeys); free(fa->cpVals);
+        fa->cpKeys = nk; fa->cpVals = nv; fa->cpCap = newCap;
+    }
+    uint32_t h = (cp * 2654435761u) & (fa->cpCap - 1);
+    while (fa->cpKeys[h] != 0xFFFFFFFFu) {
+        if (fa->cpKeys[h] == cp) { fa->cpVals[h] = glyphIdx; return true; }
+        h = (h + 1) & (fa->cpCap - 1);
+    }
+    fa->cpKeys[h] = cp; fa->cpVals[h] = glyphIdx; fa->cpCount++;
+    return true;
+}
+
+// shelf packer on the CURRENT page. false = page full (caller opens a new one).
+bool Prim32PackRect(FontAtlas* fa, int w, int h, int* outX, int* outY) {
+    if (w + 4 > fa->pageW || h + 4 > fa->pageH) return false;      // absurd glyph
+    if (fa->penX + w + 2 > fa->pageW) {                             // new shelf
+        fa->penX = 2;
+        fa->penY += fa->shelfH + 2;
+        fa->shelfH = 0;
+    }
+    if (fa->penY + h + 2 > fa->pageH) return false;                 // page full
+    *outX = fa->penX; *outY = fa->penY;
+    fa->penX += w + 2;
+    if (h > fa->shelfH) fa->shelfH = h;
+    return true;
+}
+
+// breakable before CJK ideographs / kana / fullwidth forms
+static inline bool CjkBreakable(uint32_t cp) {
+    return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+           (cp >= 0xFF00 && cp <= 0xFFEF) || (cp >= 0x20000 && cp <= 0x3FFFF);
+}
+
 // width of a single line, stopping at \n or `end`
-float Prim32LineWidth(const FontAtlas* fa, const char* s, const char* end) {
+float Prim32LineWidth(FontAtlas* fa, const char* s, const char* end) {
     float w = 0; uint32_t prev = 0;
-    for (; s < end && *s && *s != '\n'; s++) {
-        uint32_t ch = (uint8_t)*s;
-        if (ch < 32) continue;
-        w += Kern(fa, prev, ch) + fa->glyphs[ch - 32].advance;
-        prev = ch;
+    while (s < end && *s) {
+        const char* at = s;
+        uint32_t cp = Prim32Utf8Next(&s, end);
+        (void)at;
+        if (cp == (uint32_t)'\n') break;
+        if (cp < 32) continue;
+        Glyph* gl = Prim32GetGlyph(fa, cp);
+        if (prev) w += Kern(fa, prev, cp);
+        w += gl->advance;
+        prev = cp < 0x10000 ? cp : 0;
     }
     return w;
 }
 
-// Greedy word wrap: returns the exclusive end of the next line. Breaks at
-// \n always; at word boundaries when wrapW > 0 (falls back to mid-word for
-// single words wider than wrapW so progress is guaranteed).
-const char* Prim32WrapBreak(const FontAtlas* fa, const char* s, const char* end, float wrapW, float* outWidth) {
+// Greedy word wrap: returns the exclusive end of the next line. Breaks at \n
+// always; at spaces or before CJK ideographs when wrapW > 0; mid-word as a
+// last resort so progress is guaranteed.
+const char* Prim32WrapBreak(FontAtlas* fa, const char* s, const char* end, float wrapW, float* outWidth) {
     float w = 0; uint32_t prev = 0;
-    const char* lastSpace = nullptr; float wAtSpace = 0;
+    const char* lastBreak = nullptr; float wAtBreak = 0;
     const char* p = s;
-    for (; p < end && *p; p++) {
-        char ch = *p;
-        if (ch == '\n') break;
-        if ((uint8_t)ch < 32) continue;
-        float adv = Kern(fa, prev, (uint8_t)ch) + fa->glyphs[(uint8_t)ch - 32].advance;
-        if (wrapW > 0 && w + adv > wrapW && p > s) {
-            if (lastSpace) { if (outWidth) *outWidth = wAtSpace; return lastSpace; }
+    while (p < end && *p) {
+        const char* at = p;
+        uint32_t cp = Prim32Utf8Next(&p, end);
+        if (cp == (uint32_t)'\n') { p = at; break; }
+        if (cp < 32) continue;
+        Glyph* gl = Prim32GetGlyph(fa, cp);
+        float adv = (prev ? Kern(fa, prev, cp) : 0.0f) + gl->advance;
+        if (wrapW > 0 && CjkBreakable(cp) && at > s) { lastBreak = at; wAtBreak = w; }
+        if (wrapW > 0 && w + adv > wrapW && at > s) {
+            if (lastBreak) { if (outWidth) *outWidth = wAtBreak; return lastBreak; }
             if (outWidth) *outWidth = w;
-            return p;                        // mid-word break (word > wrapW)
+            return at;                                  // mid-word break
         }
         w += adv;
-        prev = (uint8_t)ch;
-        if (ch == ' ') { lastSpace = p; wAtSpace = w - adv; }
+        prev = cp < 0x10000 ? cp : 0;
+        if (cp == ' ') { lastBreak = at; wAtBreak = w - adv; }
     }
     if (outWidth) *outWidth = w;
     return p;
 }
 
 // full measurement: honors \n, optional wrap, line-spacing multiplier
-Vec2 Prim32MeasureAtlas(const FontAtlas* fa, const char* text, const char* end, float wrapW, float lineSpacing) {
+Vec2 Prim32MeasureAtlas(FontAtlas* fa, const char* text, const char* end, float wrapW, float lineSpacing) {
     if (!end) end = text + strlen(text);
     float maxW = 0; int lines = 0;
     const char* s = text;
@@ -233,40 +218,41 @@ Vec2 Prim32MeasureAtlas(const FontAtlas* fa, const char* text, const char* end, 
 // ===== PRIM32_PURE_TEXT_END =====
 
 // ---------------------------------------------------------------------- text
-// Hot loop: one 32-byte store per visible glyph.
-static void DrawTextAtlas(Context* c, const FontAtlas* fa, uint32_t texSlot,
-                          float x, float y, Col col, const char* text, const char* end) {
-    const Glyph* glyphs = fa->glyphs;
+// Hot loop: UTF-8 decode + cache lookup + one 32-byte store per glyph.
+// Unseen glyphs rasterize once inside Prim32GetGlyph (any script, any plane).
+static void DrawTextAtlas(Context* c, FontAtlas* fa, float x, float y, Col col,
+                          const char* text, const char* end) {
     float penX = x, baseline = y + fa->ascent;
     const uint32_t clip = c->curClip;
     uint32_t prev = 0;
     if (!end) end = text + strlen(text);
-    for (const char* s = text; s < end; s++) {
-        uint32_t ch = (uint8_t)*s;
-        if (ch == '\n') { penX = x; baseline += fa->lineHeight; prev = 0; continue; }
-        if (ch < 32) continue;
-        const Glyph* gl = &glyphs[ch - 32];
-        penX += Kern(fa, prev, ch);
-        if (gl->x1 > gl->x0) {                       // skip pure-advance glyphs (space)
+    const char* s = text;
+    while (s < end && *s) {
+        uint32_t cp = Prim32Utf8Next(&s, end);
+        if (cp == (uint32_t)'\n') { penX = x; baseline += fa->lineHeight; prev = 0; continue; }
+        if (cp < 32) continue;
+        Glyph* gl = Prim32GetGlyph(fa, cp);
+        if (prev) penX += Kern(fa, prev, cp);
+        if (gl->x1 > gl->x0) {
             Prim* p = AddPrims(c, 1); if (!p) return;
             p->x0 = penX + gl->x0; p->y0 = baseline + gl->y0;
             p->x1 = penX + gl->x1; p->y1 = baseline + gl->y1;
             p->uv0 = gl->uv0; p->uv1 = gl->uv1;
             p->color = col;
-            p->meta = PackMeta(PRIM_GLYPH, clip, texSlot);
+            p->meta = PackMeta(PRIM_GLYPH, clip, gl->texSlot);
         }
         penX += gl->advance;
-        prev = ch;
+        prev = cp < 0x10000 ? cp : 0;
     }
 }
 
 void DrawText(Context* c, float x, float y, Col col, const char* text, const char* end) {
     ResolvedFont rf = Prim32ResolveFont(InvalidFontHandle);
-    DrawTextAtlas(c, rf.atlas, rf.texSlot, x, y, col, text, end);
+    DrawTextAtlas(c, rf.atlas, x, y, col, text, end);
 }
 void DrawText(Context* c, FontHandle font, float x, float y, Col col, const char* text, const char* end) {
     ResolvedFont rf = Prim32ResolveFont(font);
-    DrawTextAtlas(c, rf.atlas, rf.texSlot, x, y, col, text, end);
+    DrawTextAtlas(c, rf.atlas, x, y, col, text, end);
 }
 
 Vec2 TextSize(Context* c, const char* text, const char* end) {
@@ -293,7 +279,7 @@ void DrawTextOpt(Context* c, FontHandle font, const char* text, const prim32::Re
         float x = b.x;
         if (opt.align == ALIGN_CENTER)     x += (b.w - w) * 0.5f;
         else if (opt.align == ALIGN_RIGHT) x += b.w - w;
-        DrawTextAtlas(c, rf.atlas, rf.texSlot, x, y, col, s, brk);
+        DrawTextAtlas(c, rf.atlas, x, y, col, s, brk);
         y += lh;
         s = brk;
         if (s < end && *s == '\n') s++;
@@ -350,9 +336,10 @@ Context* CreateContext(const FontDesc* fd) {
     c->style.Dark();
     FontDesc def = { L"Segoe UI", 17.0f, true };
     if (!fd) fd = &def;
-    if (!Prim32BakeFont(&c->font, fd->face, fd->sizePx, fd->kerning)) {
-        Prim32BakeFont(&c->font, L"Arial", fd->sizePx, fd->kerning);
+    if (!Prim32FontInitGDI(&c->font, nullptr, 0, fd->face, fd->sizePx, fd->kerning)) {
+        Prim32FontInitGDI(&c->font, nullptr, 0, L"Arial", fd->sizePx, fd->kerning);
     }
+    Prim32PrewarmAscii(&c->font);   // first frame never rasterizes basic Latin
     c->drawList.ctx = c;
     c->fontStackTop = -1;
     c->defaultFont = InvalidFontHandle;   // resolves to the built-in font
@@ -361,11 +348,7 @@ Context* CreateContext(const FontDesc* fd) {
     g = c;
     return c;
 }
-void Prim32FreeFontAtlas(FontAtlas* fa) {
-    if (!fa) return;
-    free(fa->pixels); free(fa->kernKeys); free(fa->kernVals);
-    fa->pixels = nullptr; fa->kernKeys = nullptr; fa->kernVals = nullptr;
-}
+// Prim32FreeFontAtlas lives in prim32_resources.cpp (rasterizer teardown)
 
 void DestroyContext(Context* c) {
     if (!c) return;

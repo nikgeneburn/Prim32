@@ -62,13 +62,13 @@ struct ImageRes {
     char     name[48];     // debug name / path tail
 };
 struct FontRes {
-    uint32_t  gen;
-    bool      used;
-    bool      ownsAtlas;   // built-in font's atlas is owned by the Context
-    uint32_t  texSlot;
-    FontAtlas atlas;
-    uint64_t  bytes;
-    char      name[48];
+    uint32_t   gen;
+    bool       used;
+    bool       ownsAtlas;   // built-in font's atlas is owned by the Context
+    uint32_t   texSlot;     // first page slot (info only; glyphs carry their own)
+    FontAtlas* atlas;       // canonical — the cache mutates it, so never copy
+    uint64_t   bytes;
+    char       name[48];
 };
 
 static ImageRes s_images[MAX_IMAGES];   // index 0 reserved (invalid)
@@ -128,23 +128,23 @@ void Prim32RegisterBuiltinFont(Context* ctx) {
     f.used = true;
     f.gen = f.gen ? f.gen : 1;
     f.ownsAtlas = false;                 // Context owns the built-in atlas
-    f.texSlot = 0;                       // backend always uploads it to slot 0
-    f.atlas = ctx->font;                 // shared pointers, not owned
-    f.bytes = (uint64_t)ctx->font.width * ctx->font.height;
+    f.texSlot = ctx->font.pageSlot;
+    f.atlas = &ctx->font;                // canonical pointer, not a copy
+    f.bytes = (uint64_t)ctx->font.pageW * ctx->font.pageH;
     snprintf(f.name, sizeof(f.name), "built-in (%.0fpx)", ctx->font.size);
     if (s_fontHigh < 2) s_fontHigh = 2;
 }
 
 ResolvedFont Prim32ResolveFont(FontHandle h) {
     Context* c = GetContext();
-    if (FontRes* r = RegGetFont(h)) return { &r->atlas, r->texSlot };
+    if (FontRes* r = RegGetFont(h)) return { r->atlas };
     if (c && c->fontStackTop >= 0)
         if (FontRes* r = RegGetFont(c->fontStack[c->fontStackTop]))
-            return { &r->atlas, r->texSlot };
+            return { r->atlas };
     if (c)
         if (FontRes* r = RegGetFont(c->defaultFont))
-            return { &r->atlas, r->texSlot };
-    return { &s_fonts[1].atlas, s_fonts[1].texSlot };    // built-in fallback
+            return { r->atlas };
+    return { s_fonts[1].atlas ? s_fonts[1].atlas : &GetContext()->font };
 }
 
 void SetDefaultFont(FontHandle h) {
@@ -180,6 +180,232 @@ Vec2 MeasureText(FontHandle font, const char* text, const char* end) {
 }
 float GetFontLineHeight(FontHandle font) {
     return Prim32ResolveFont(font).atlas->lineHeight;
+}
+
+// ======================================================= dynamic glyph engine
+// Rasterizers own a shared scratch (single-threaded, like the rest of prim32).
+static uint8_t* s_ggoBuf;  static size_t s_ggoCap;    // raw GGO output
+static uint8_t* s_a8Buf;   static size_t s_a8Cap;     // converted A8
+
+static uint8_t* Scratch(uint8_t** buf, size_t* cap, size_t need) {
+    if (need > *cap) {
+        size_t n = *cap ? *cap : 4096;
+        while (n < need) n *= 2;
+        *buf = (uint8_t*)realloc(*buf, n);
+        *cap = n;
+    }
+    return *buf;
+}
+
+// ---- GDI rasterizer: full BMP coverage (CJK, Cyrillic, PUA icons, ...)
+bool Prim32RasterGlyphGDI(FontAtlas* fa, uint32_t cp, GlyphBitmap* out) {
+    if (cp > 0xFFFF) return false;                     // GDI path is BMP-only (FreeType covers the rest)
+    HDC dc = (HDC)fa->rasterA;
+    if (!dc) return false;
+    const MAT2 mat = { {0,1},{0,0},{0,0},{0,1} };
+    GLYPHMETRICS gm = {};
+    DWORD sz = GetGlyphOutlineW(dc, (UINT)cp, GGO_GRAY8_BITMAP, &gm, 0, nullptr, &mat);
+    if (sz == GDI_ERROR) return false;
+    int w = (int)gm.gmBlackBoxX, h = (int)gm.gmBlackBoxY;
+    out->advance  = (float)gm.gmCellIncX;
+    out->bearingX = gm.gmptGlyphOrigin.x;
+    out->bearingY = gm.gmptGlyphOrigin.y;
+    out->w = 0; out->h = 0; out->pixels = nullptr; out->pitch = 0;
+    if (!sz || w <= 0 || h <= 0) return true;          // advance-only (space etc.)
+    uint8_t* raw = Scratch(&s_ggoBuf, &s_ggoCap, sz);
+    GLYPHMETRICS gm2;
+    if (GetGlyphOutlineW(dc, (UINT)cp, GGO_GRAY8_BITMAP, &gm2, sz, raw, &mat) == GDI_ERROR) return false;
+    int pitch = (w + 3) & ~3;                          // GGO rows are DWORD aligned
+    uint8_t* a8 = Scratch(&s_a8Buf, &s_a8Cap, (size_t)w * h);
+    for (int r = 0; r < h; r++)
+        for (int x = 0; x < w; x++) {
+            uint32_t v = raw[(size_t)r * pitch + x] * 255u / 64u;   // 0..64 -> 0..255
+            a8[(size_t)r * w + x] = v > 255 ? 255 : (uint8_t)v;
+        }
+    out->w = w; out->h = h; out->pixels = a8; out->pitch = w;
+    return true;
+}
+
+static void RasterKernGDI(FontAtlas* fa) {
+    HDC dc = (HDC)fa->rasterA;
+    fa->kernCount = 0; fa->kernKeys = nullptr; fa->kernVals = nullptr;
+    DWORD n = GetKerningPairsW(dc, 0, nullptr);
+    if (!n || n == GDI_ERROR) return;
+    KERNINGPAIR* kp = (KERNINGPAIR*)malloc(n * sizeof(KERNINGPAIR));
+    n = GetKerningPairsW(dc, n, kp);
+    if (n && n != GDI_ERROR) {
+        fa->kernKeys = (uint32_t*)malloc(n * 4);
+        fa->kernVals = (float*)malloc(n * 4);
+        uint32_t m = 0;
+        for (DWORD k = 0; k < n; k++)
+            if (kp[k].iKernAmount) {
+                fa->kernKeys[m] = ((uint32_t)kp[k].wFirst << 16) | kp[k].wSecond;
+                fa->kernVals[m] = (float)kp[k].iKernAmount; m++;
+            }
+        fa->kernCount = m;
+        for (uint32_t a = 1; a < m; a++) {             // insertion sort (nearly sorted)
+            uint32_t key = fa->kernKeys[a]; float val = fa->kernVals[a]; uint32_t b = a;
+            while (b && fa->kernKeys[b - 1] > key) { fa->kernKeys[b] = fa->kernKeys[b-1]; fa->kernVals[b] = fa->kernVals[b-1]; b--; }
+            fa->kernKeys[b] = key; fa->kernVals[b] = val;
+        }
+    }
+    free(kp);
+}
+
+// ---- atlas pages
+static bool NewPage(FontAtlas* fa) {
+    if (fa->pageCount >= 8) return false;              // page cap (see docs)
+    uint8_t* px = (uint8_t*)calloc(1, (size_t)fa->pageW * fa->pageH);
+    if (!px) return false;
+    uint32_t slot = 0;
+    const Prim32BackendHooks* hk = Prim32GetBackendHooks();
+    if (hk && hk->createTexture) {
+        slot = hk->createTexture(px, fa->pageW, fa->pageH, 0, "glyph atlas page");
+        if (slot == 0xFFFFFFFFu) { free(px); return false; }
+    }
+    free(fa->pagePixels);                              // old page fully uploaded already
+    fa->pagePixels = px;
+    fa->pageSlot = slot;
+    fa->pageSlots[fa->pageCount++] = slot;
+    fa->penX = fa->penY = 2; fa->shelfH = 0;
+    return true;
+}
+
+bool Prim32AtlasInit(FontAtlas* fa, float sizePx) {
+    fa->glyphCap = 256;
+    fa->glyphs = (Glyph*)calloc(fa->glyphCap, sizeof(Glyph));
+    fa->glyphCount = 1;                                // [0] = notdef
+    memset(fa->asciiMap, 0, sizeof(fa->asciiMap));
+    fa->cpKeys = nullptr; fa->cpVals = nullptr; fa->cpCap = 0; fa->cpCount = 0;
+    fa->pageW = fa->pageH = sizePx <= 24.0f ? 512 : 1024;
+    fa->pagePixels = nullptr; fa->pageCount = 0;
+    if (!fa->glyphs || !NewPage(fa)) return false;
+    // notdef: a hollow box baked procedurally into page 0
+    int bw = (int)(sizePx * 0.50f); if (bw < 4) bw = 4;
+    int bh = (int)(sizePx * 0.64f); if (bh < 5) bh = 5;
+    int x, y;
+    if (Prim32PackRect(fa, bw, bh, &x, &y)) {
+        for (int r = 0; r < bh; r++)
+            for (int cxi = 0; cxi < bw; cxi++) {
+                bool edge = r == 0 || r == bh - 1 || cxi == 0 || cxi == bw - 1;
+                fa->pagePixels[(size_t)(y + r) * fa->pageW + (x + cxi)] = edge ? 255 : 0;
+            }
+        const Prim32BackendHooks* hk = Prim32GetBackendHooks();
+        if (hk && hk->updateTexture)
+            hk->updateTexture(fa->pageSlot, x, y, bw, bh,
+                              fa->pagePixels + (size_t)y * fa->pageW + x, fa->pageW);
+        Glyph* nd = &fa->glyphs[0];
+        nd->uv0 = PackUV((float)x / fa->pageW, (float)y / fa->pageH);
+        nd->uv1 = PackUV((float)(x + bw) / fa->pageW, (float)(y + bh) / fa->pageH);
+        nd->x0 = 1.0f; nd->y0 = (float)-bh;
+        nd->x1 = 1.0f + bw; nd->y1 = 0.0f;
+        nd->advance = bw + 2.0f;
+        nd->texSlot = fa->pageSlot;
+    }
+    return true;
+}
+
+// ---- rasterize-on-miss. Never null; pointer valid until the next call.
+Glyph* Prim32GetGlyph(FontAtlas* fa, uint32_t cp) {
+    uint32_t idx = Prim32CacheFind(fa, cp);
+    if (idx) return &fa->glyphs[idx];
+    if (!fa->glyphs) return nullptr;                   // uninitialized atlas (never in practice)
+
+    GlyphBitmap bm = {};
+    bool ok = false;
+    if (fa->rasterKind == 0) ok = Prim32RasterGlyphGDI(fa, cp, &bm);
+#ifdef PRIM32_HAS_FREETYPE
+    else if (fa->rasterKind == 1) ok = Prim32RasterGlyphFT(fa, cp, &bm);
+#endif
+    if (!ok) { Prim32CacheInsert(fa, cp, 0); return &fa->glyphs[0]; }   // notdef
+
+    if (fa->glyphCount == fa->glyphCap) {
+        uint32_t nc = fa->glyphCap * 2;
+        Glyph* ng = (Glyph*)realloc(fa->glyphs, (size_t)nc * sizeof(Glyph));
+        if (!ng) { Prim32CacheInsert(fa, cp, 0); return &fa->glyphs[0]; }
+        fa->glyphs = ng; fa->glyphCap = nc;
+    }
+    uint32_t gi = fa->glyphCount;
+    Glyph* gl = &fa->glyphs[gi];
+    memset(gl, 0, sizeof(*gl));
+    gl->advance = bm.advance;
+    gl->texSlot = fa->pageSlot;
+
+    if (bm.w > 0 && bm.h > 0) {
+        int x, y;
+        if (!Prim32PackRect(fa, bm.w, bm.h, &x, &y)) {
+            if (!NewPage(fa) || !Prim32PackRect(fa, bm.w, bm.h, &x, &y)) {
+                Prim32CacheInsert(fa, cp, 0);          // atlas exhausted: notdef
+                return &fa->glyphs[0];
+            }
+        }
+        for (int r = 0; r < bm.h; r++)
+            memcpy(fa->pagePixels + (size_t)(y + r) * fa->pageW + x,
+                   bm.pixels + (size_t)r * bm.pitch, (size_t)bm.w);
+        const Prim32BackendHooks* hk = Prim32GetBackendHooks();
+        if (hk && hk->updateTexture)
+            hk->updateTexture(fa->pageSlot, x, y, bm.w, bm.h,
+                              fa->pagePixels + (size_t)y * fa->pageW + x, fa->pageW);
+        gl->uv0 = PackUV((float)x / fa->pageW, (float)y / fa->pageH);
+        gl->uv1 = PackUV((float)(x + bm.w) / fa->pageW, (float)(y + bm.h) / fa->pageH);
+        gl->x0 = (float)bm.bearingX;      gl->y0 = (float)-bm.bearingY;
+        gl->x1 = gl->x0 + bm.w;           gl->y1 = gl->y0 + bm.h;
+        gl->texSlot = fa->pageSlot;
+    }
+    fa->glyphCount++;
+    Prim32CacheInsert(fa, cp, gi);
+    return &fa->glyphs[gi];
+}
+
+void Prim32PrewarmAscii(FontAtlas* fa) {
+    for (uint32_t cp = 32; cp < 127; cp++) Prim32GetGlyph(fa, cp);
+}
+
+// ---- font lifecycle
+bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
+                       const wchar_t* face, float sizePx, bool kerning) {
+    memset(fa, 0, sizeof(*fa));
+    fa->rasterKind = 0;
+    if (data) {                                        // memory font: GDI copies the bytes
+        DWORD installed = 0;
+        HANDLE mem = AddFontMemResourceEx((PVOID)data, (DWORD)size, nullptr, &installed);
+        if (!mem || !installed) return false;
+        fa->rasterC = mem;                             // kept until FreeFontAtlas (lazy raster!)
+    }
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT font = CreateFontW(-(int)(sizePx + 0.5f), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
+    if (!dc || !font) {
+        if (dc) DeleteDC(dc);
+        if (font) DeleteObject(font);
+        if (fa->rasterC) RemoveFontMemResourceEx((HANDLE)fa->rasterC);
+        return false;
+    }
+    SelectObject(dc, font);
+    fa->rasterA = dc; fa->rasterB = font;
+    TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
+    fa->ascent = (float)tm.tmAscent; fa->descent = (float)tm.tmDescent;
+    fa->lineHeight = (float)(tm.tmHeight + tm.tmExternalLeading);
+    fa->size = sizePx;
+    if (kerning) RasterKernGDI(fa);
+    return Prim32AtlasInit(fa, sizePx);
+}
+
+void Prim32FreeFontAtlas(FontAtlas* fa) {
+    if (!fa) return;
+    if (fa->rasterKind == 0) {
+        if (fa->rasterB) DeleteObject((HFONT)fa->rasterB);
+        if (fa->rasterA) DeleteDC((HDC)fa->rasterA);
+        if (fa->rasterC) RemoveFontMemResourceEx((HANDLE)fa->rasterC);
+    }
+#ifdef PRIM32_HAS_FREETYPE
+    else if (fa->rasterKind == 1) Prim32RasterFreeFT(fa);
+#endif
+    free(fa->glyphs); free(fa->cpKeys); free(fa->cpVals);
+    free(fa->pagePixels);
+    free(fa->kernKeys); free(fa->kernVals);
+    memset(fa, 0, sizeof(*fa));
 }
 
 // ---------------------------------------------------- TTF/OTF family name
@@ -241,40 +467,47 @@ FontHandle LoadFontFromMemory(const void* data, size_t size, float sizePixels) {
     if (sizePixels < 4 || sizePixels > 256) { SetErr("LoadFontFromMemory: bad size %.1f px", sizePixels); return InvalidFontHandle; }
     if (!s_hooks)                    { SetErr("LoadFontFromMemory: backend not initialized"); return InvalidFontHandle; }
 
+    FontAtlas* atlas = (FontAtlas*)calloc(1, sizeof(FontAtlas));
+    if (!atlas) { SetErr("LoadFontFromMemory: out of memory"); return InvalidFontHandle; }
+
+    bool ok = false;
+    char rasterName[16];
+#ifdef PRIM32_HAS_FREETYPE
+    // FreeType covers every plane (astral CJK extensions, etc.)
+    ok = Prim32FontInitFT(atlas, data, size, sizePixels, true);
+    snprintf(rasterName, sizeof(rasterName), "freetype");
+    if (!ok) SetErr("LoadFontFromMemory: FreeType could not load the face");
+#else
+    // GDI (zero dependencies): full Basic Multilingual Plane — CJK, Cyrillic,
+    // Greek, Arabic glyphs, icon fonts in the PUA, ...
     wchar_t family[64];
     if (!TtfFamilyName((const uint8_t*)data, size, family)) {
+        free(atlas);
         SetErr("LoadFontFromMemory: could not parse font family name (not a TTF/OTF/TTC?)");
         return InvalidFontHandle;
     }
-    // GDI copies the font data — caller's buffer is free to go after this call.
-    DWORD installed = 0;
-    HANDLE mem = AddFontMemResourceEx((PVOID)data, (DWORD)size, nullptr, &installed);
-    if (!mem || !installed)          { SetErr("LoadFontFromMemory: AddFontMemResourceEx failed"); return InvalidFontHandle; }
+    ok = Prim32FontInitGDI(atlas, data, size, family, sizePixels, true);
+    snprintf(rasterName, sizeof(rasterName), "gdi");
+    if (!ok) SetErr("LoadFontFromMemory: GDI could not load the face");
+#endif
+    if (!ok) { free(atlas); return InvalidFontHandle; }
 
-    FontAtlas atlas = {};
-    bool ok = Prim32BakeFont(&atlas, family, sizePixels, true);
-    RemoveFontMemResourceEx(mem);    // atlas is rasterized; GDI font no longer needed
-    if (!ok)                         { SetErr("LoadFontFromMemory: rasterization failed"); return InvalidFontHandle; }
+    Prim32PrewarmAscii(atlas);              // basic Latin never rasterizes mid-frame
 
-    uint32_t slot = s_hooks->createTexture(atlas.pixels, atlas.width, atlas.height, 0, "font atlas");
-    if (slot == 0xFFFFFFFFu) {
-        Prim32FreeFontAtlas(&atlas);
-        SetErr("LoadFontFromMemory: GPU atlas creation failed");
+    uint32_t idx = RegAllocFont();
+    if (!idx) {
+        Prim32FreeFontAtlas(atlas); free(atlas);
+        SetErr("LoadFontFromMemory: font table full (%u)", MAX_FONTS);
         return InvalidFontHandle;
     }
-    uint32_t idx = RegAllocFont();
-    if (!idx) { s_hooks->destroyTexture(slot); Prim32FreeFontAtlas(&atlas); SetErr("LoadFontFromMemory: font table full (%u)", MAX_FONTS); return InvalidFontHandle; }
-
     FontRes& f = s_fonts[idx];
     uint32_t gen = f.gen + 1; if (!gen) gen = 1;
     f = {};
     f.gen = gen; f.used = true; f.ownsAtlas = true;
-    f.texSlot = slot; f.atlas = atlas;
-    f.bytes = (uint64_t)atlas.width * atlas.height;
-    char nameA[64]; int k = 0;
-    for (; family[k] && k < 47; k++) nameA[k] = family[k] < 128 ? (char)family[k] : '?';
-    nameA[k] = 0;
-    snprintf(f.name, sizeof(f.name), "%s %.0fpx", nameA, sizePixels);
+    f.texSlot = atlas->pageSlot;
+    f.atlas = atlas;
+    f.bytes = (uint64_t)atlas->pageW * atlas->pageH * atlas->pageCount;
+    snprintf(f.name, sizeof(f.name), "font %.0fpx (%s)", sizePixels, rasterName);
     return { idx, f.gen };
 }
 
@@ -305,8 +538,11 @@ void DestroyFont(FontHandle h) {
     FontRes* r = RegGetFont(h);
     if (!r) return;
     if (h.index == 1) { SetErr("DestroyFont: the built-in font cannot be destroyed"); return; }
-    if (s_hooks) s_hooks->destroyTexture(r->texSlot);
-    if (r->ownsAtlas) Prim32FreeFontAtlas(&r->atlas);
+    if (s_hooks && r->atlas)
+        for (int p = 0; p < r->atlas->pageCount; p++)
+            s_hooks->destroyTexture(r->atlas->pageSlots[p]);   // fence-deferred
+    if (r->ownsAtlas && r->atlas) { Prim32FreeFontAtlas(r->atlas); free(r->atlas); }
+    r->atlas = nullptr;
     r->used = false;
     r->gen++; if (!r->gen) r->gen = 1;                  // stale handles now invalid
     // font-stack / default entries pointing here now safely resolve to fallback

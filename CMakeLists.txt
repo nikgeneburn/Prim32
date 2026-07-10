@@ -22,11 +22,17 @@ set(PRIM32_PUBLIC_HEADERS
 set(PRIM32_SOURCES
     src/prim32.cpp
     src/prim32_resources.cpp
+    src/prim32_freetype.cpp
     src/prim32_internal.h
     src/backends/prim32_dx12.cpp
     src/profiler/p32prof.cpp
     src/profiler/p32prof_ui.cpp
 )
+
+# Optional FreeType rasterizer: covers every Unicode plane (the default GDI
+# path covers the Basic Multilingual Plane with zero dependencies).
+#   vcpkg install freetype && cmake -DPRIM32_WITH_FREETYPE=ON ...
+option(PRIM32_WITH_FREETYPE "Rasterize fonts with FreeType instead of GDI" OFF)
 
 add_library(prim32 STATIC)
 add_library(Prim32::Prim32 ALIAS prim32)
@@ -41,6 +47,11 @@ target_include_directories(prim32
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_definitions(prim32 PRIVATE UNICODE _UNICODE)
+if(PRIM32_WITH_FREETYPE)
+    find_package(Freetype REQUIRED)
+    target_compile_definitions(prim32 PRIVATE PRIM32_HAS_FREETYPE)
+    target_link_libraries(prim32 PRIVATE Freetype::Freetype)
+endif()
 target_link_libraries(prim32
     PUBLIC
         d3d12

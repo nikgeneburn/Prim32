@@ -118,19 +118,55 @@ static inline uint32_t PackUV(float u, float v) {   // unorm16x2
 
 // ------------------------------------------------------------------ font data
 struct Glyph {
-    uint32_t uv0, uv1;      // pre-packed atlas uvs (unorm16x2)
-    float    x0, y0, x1, y1;// draw rect relative to pen (x, baseline)
+    uint32_t uv0, uv1;       // pre-packed atlas uvs (unorm16x2)
+    float    x0, y0, x1, y1; // draw rect relative to pen (x, baseline)
     float    advance;
+    uint32_t texSlot;        // atlas page this glyph lives on
 };
+
+// Dynamic Unicode glyph cache. All text APIs take UTF-8; glyphs of ANY script
+// (Latin, Cyrillic, CJK, icon fonts in the Private Use Area, ...) rasterize on
+// first use, pack into atlas pages, and upload incrementally — no atlas
+// rebuilds, no pre-baking 20k CJK glyphs. Rasterizers: GDI by default
+// (zero dependencies, full BMP coverage), FreeType when the library is built
+// with PRIM32_HAS_FREETYPE (all planes).
 struct FontAtlas {
-    uint8_t* pixels;        // R8, owned by context
-    int      width, height;
-    Glyph    glyphs[224];   // codepoints 32..255
-    float    ascent, descent, lineHeight, size;
+    // glyph pool ([0] = notdef box) + lookup
+    Glyph*    glyphs;
+    uint32_t  glyphCount, glyphCap;
+    uint32_t  asciiMap[95];          // cp 32..126 -> pool index (0 = not cached)
+    uint32_t* cpKeys;                // open-addressed cp -> pool index (+1)
+    uint32_t* cpVals;
+    uint32_t  cpCap, cpCount;
+    // current atlas page (CPU copy kept for incremental region uploads)
+    uint8_t*  pagePixels;
+    int       pageW, pageH;
+    int       penX, penY, shelfH;
+    uint32_t  pageSlot;              // texture slot of the page being filled
+    int       pageCount;
+    uint32_t  pageSlots[8];          // every page's slot (destroy/inspection)
+    // metrics
+    float ascent, descent, lineHeight, size;
+    // kerning (BMP pairs, sorted)
     uint32_t kernCount;
-    uint32_t* kernKeys;     // (a<<16)|b, sorted
+    uint32_t* kernKeys;              // (a<<16)|b
     float*    kernVals;
+    // rasterizer binding (GDI: dc/font/memHandle — FreeType: library/face/data)
+    void* rasterA; void* rasterB; void* rasterC;
+    int   rasterKind;                // 0 = GDI, 1 = FreeType
 };
+
+// Encode one codepoint as UTF-8 (for icon fonts: EncodeUtf8(0xE700, buf)).
+// Returns byte count; out must hold 5 bytes (NUL-terminated).
+static inline int EncodeUtf8(uint32_t cp, char out[5]) {
+    int n = 0;
+    if (cp < 0x80)        { out[n++] = (char)cp; }
+    else if (cp < 0x800)  { out[n++] = (char)(0xC0 | (cp >> 6));  out[n++] = (char)(0x80 | (cp & 63)); }
+    else if (cp < 0x10000){ out[n++] = (char)(0xE0 | (cp >> 12)); out[n++] = (char)(0x80 | ((cp >> 6) & 63)); out[n++] = (char)(0x80 | (cp & 63)); }
+    else                  { out[n++] = (char)(0xF0 | (cp >> 18)); out[n++] = (char)(0x80 | ((cp >> 12) & 63)); out[n++] = (char)(0x80 | ((cp >> 6) & 63)); out[n++] = (char)(0x80 | (cp & 63)); }
+    out[n] = 0;
+    return n;
+}
 
 // ------------------------------------------------------------------------ IO
 struct IO {

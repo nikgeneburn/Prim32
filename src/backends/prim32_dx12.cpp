@@ -209,6 +209,10 @@ static struct {
     uint64_t                 lastVramMs;
     // texture slots (font atlases + images); owned resources released here
     struct TexRes { ID3D12Resource* res; bool owned; uint64_t bytes; };
+    // queued glyph-atlas region updates (flushed at the start of Render)
+    struct TexUpd { uint32_t slot; int x, y, w, h; uint8_t* pixels; };
+    TexUpd*                  texUpd;
+    uint32_t                 texUpdCount, texUpdCap;
     TexRes                   texRes[64];
     uint16_t                 freeSlots[64];
     uint32_t                 freeCount;
@@ -445,7 +449,90 @@ static void HookDestroyTexture(uint32_t slot) {
     WriteNullSrv(slot);
     if (S.freeCount < 64) S.freeSlots[S.freeCount++] = (uint16_t)slot;
 }
-static const prim32::Prim32BackendHooks s_prim32Hooks = { &HookCreateTexture, &HookDestroyTexture };
+// Queue a region update; pixels are copied NOW (tight pitch), uploaded at the
+// start of the next Render on the app's command list.
+static void HookUpdateTexture(uint32_t slot, int x, int y, int w, int h, const uint8_t* pixels, int pitch) {
+    if (slot >= 64 || w <= 0 || h <= 0) return;
+    if (S.texUpdCount == S.texUpdCap) {
+        uint32_t nc = S.texUpdCap ? S.texUpdCap * 2 : 64;
+        void* np = realloc(S.texUpd, nc * sizeof(*S.texUpd));
+        if (!np) return;
+        S.texUpd = (decltype(S.texUpd))np; S.texUpdCap = nc;
+    }
+    uint8_t* copy = (uint8_t*)malloc((size_t)w * h);
+    if (!copy) return;
+    for (int r = 0; r < h; r++)
+        memcpy(copy + (size_t)r * w, pixels + (size_t)r * pitch, (size_t)w);
+    S.texUpd[S.texUpdCount++] = { slot, x, y, w, h, copy };
+}
+
+// Flush queued atlas updates: one transient upload buffer, barriers per
+// texture, one CopyTextureRegion per region. Runs only on frames where new
+// glyphs appeared (first sight of a string) — steady state records nothing.
+static void FlushTextureUpdates(ID3D12GraphicsCommandList* cmd) {
+    if (!S.texUpdCount) return;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < S.texUpdCount; i++) {
+        uint64_t rowPitch = ((uint64_t)S.texUpd[i].w + 255) & ~255ull;
+        total = ((total + 511) & ~511ull) + rowPitch * S.texUpd[i].h;
+    }
+    ID3D12Resource* up = CreateBuffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!up) { for (uint32_t i = 0; i < S.texUpdCount; i++) free(S.texUpd[i].pixels); S.texUpdCount = 0; return; }
+    uint8_t* map = nullptr; D3D12_RANGE rr = { 0, 0 };
+    up->Map(0, &rr, (void**)&map);
+
+    bool touched[64] = {};
+    D3D12_RESOURCE_BARRIER bars[64]; uint32_t nb = 0;
+    for (uint32_t i = 0; i < S.texUpdCount; i++) {
+        uint32_t sl = S.texUpd[i].slot;
+        if (touched[sl] || !S.texRes[sl].res) continue;
+        touched[sl] = true;
+        D3D12_RESOURCE_BARRIER& b = bars[nb++];
+        b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = S.texRes[sl].res;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    if (nb) cmd->ResourceBarrier(nb, bars);
+
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < S.texUpdCount; i++) {
+        const auto& u = S.texUpd[i];
+        if (!S.texRes[u.slot].res) { free(u.pixels); continue; }
+        uint64_t rowPitch = ((uint64_t)u.w + 255) & ~255ull;
+        off = (off + 511) & ~511ull;
+        for (int r = 0; r < u.h; r++)
+            memcpy(map + off + (uint64_t)r * rowPitch, u.pixels + (size_t)r * u.w, (size_t)u.w);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = S.texRes[u.slot].res;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = up;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = off;
+        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+        src.PlacedFootprint.Footprint.Width = (UINT)u.w;
+        src.PlacedFootprint.Footprint.Height = (UINT)u.h;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
+        cmd->CopyTextureRegion(&dst, (UINT)u.x, (UINT)u.y, 0, &src, nullptr);
+        off += rowPitch * u.h;
+        free(u.pixels);
+    }
+    up->Unmap(0, nullptr);
+    for (uint32_t i = 0; i < nb; i++) {
+        D3D12_RESOURCE_STATES t = bars[i].Transition.StateBefore;
+        bars[i].Transition.StateBefore = bars[i].Transition.StateAfter;
+        bars[i].Transition.StateAfter = t;
+    }
+    if (nb) cmd->ResourceBarrier(nb, bars);
+    if (S.deadCount < 64) S.dead[S.deadCount++] = { up, S.fenceCounter + 1 };
+    else up->Release();
+    S.texUpdCount = 0;
+}
+
+static const prim32::Prim32BackendHooks s_prim32Hooks = { &HookCreateTexture, &HookDestroyTexture, &HookUpdateTexture };
 
 // Upload the built-in font atlas: slot 0, after null-filling the whole table
 // so dynamic indexing of untouched slots is always defined.
@@ -454,7 +541,8 @@ static bool UploadFontAtlas() {
     for (uint32_t i = 0; i < S.maxTextures; i++) WriteNullSrv(i);
     S.texCount = 0;
     S.freeCount = 0;
-    return CreateTexture2D(fa.pixels, fa.width, fa.height, 0, "built-in font atlas") == 0;
+    // page 0 of the built-in font (notdef + prewarmed ASCII) must land in slot 0
+    return CreateTexture2D(fa.pagePixels, fa.pageW, fa.pageH, 0, "built-in font atlas") == 0;
 }
 
 // ----------------------------------------------------------------------- API
@@ -525,8 +613,8 @@ bool Init(prim32::Context* ctx, const InitDesc& desc) {
 
     const prim32::FontAtlas& fat = ctx->font;
     p32prof::TrackMem("gpu: upload ring (mapped)", (uint64_t)frameBytes * S.numFrames);
-    p32prof::TrackMem("gpu: font atlas", (uint64_t)fat.width * fat.height);
-    p32prof::TrackMem("cpu: font atlas copy", (uint64_t)fat.width * fat.height);
+    p32prof::TrackMem("gpu: font atlas", (uint64_t)fat.pageW * fat.pageH);
+    p32prof::TrackMem("cpu: font atlas copy", (uint64_t)fat.pageW * fat.pageH);
     p32prof::TrackMem("gpu: query readback", (uint64_t)S.numFrames * TS_PER_FRAME * 8);
     return true;
 }
@@ -614,6 +702,8 @@ prim32::FrameMem NewFrame() {
 void Render(prim32::DrawData* dd, ID3D12GraphicsCommandList* cmd) {
     FrameCtx& f = S.frames[S.frameIdx];
     if (dd->displaySize.x <= 0 || dd->displaySize.y <= 0) return;
+
+    FlushTextureUpdates(cmd);   // new glyph-atlas regions land before any draw
 
     // ---- upload dirty cached layers via their own persistent upload buffer.
     // Steady state records nothing here; the GPU reads caches from VRAM.

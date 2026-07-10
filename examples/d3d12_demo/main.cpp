@@ -439,7 +439,7 @@ static void BuildStress(Context* c, float time) {
 // TextOptions (wrap/align/clip) and tinted/uv-cropped image draws.
 static void ShowDrawListDemo(Context* c) {
     static bool loaded = false;
-    static FontHandle titleFont, memFont;
+    static FontHandle titleFont, memFont, cjkFont, iconFont;
     static ImageHandle memImg, fileImg;
     static bool useMemDefault = false;
     static char log0[96], log1[96], log2[96];
@@ -458,6 +458,10 @@ static void ShowDrawListDemo(Context* c) {
         }
         snprintf(log1, sizeof(log1), "font mem:   %s", IsValid(memFont) ? "OK (consola.ttf bytes, 15px)" : GetLastResourceError());
         memImg = LoadImageFromMemory(kEmbeddedPng, sizeof(kEmbeddedPng));
+        // Unicode showcase fonts (stock Windows): CJK + the MDL2 icon font
+        cjkFont = LoadFontFromFile("C:\\Windows\\Fonts\\msyh.ttc", 18.0f);      // Microsoft YaHei
+        if (!IsValid(cjkFont)) cjkFont = LoadFontFromFile("C:\\Windows\\Fonts\\simsun.ttc", 18.0f);
+        iconFont = LoadFontFromFile("C:\\Windows\\Fonts\\segmdl2.ttf", 22.0f);   // Segoe MDL2 Assets (PUA icons)
         fileImg = LoadImageFromFile("assets/logo.png");                 // error-path demo when absent
         snprintf(log2, sizeof(log2), "image file: %s", IsValid(fileImg) ? "OK (assets/logo.png)" : GetLastResourceError());
     }
@@ -482,6 +486,39 @@ static void ShowDrawListDemo(Context* c) {
         TextOptions to; to.align = ALIGN_CENTER; to.valign = VALIGN_MIDDLE;
         to.wrapWidth = 288; to.clip = true;
         draw->Text("Wrapped, centered, vertically-aligned and clipped text in a bounds rect via TextOptions.", box, to);
+
+        // ---- Unicode: any script, glyphs rasterize on first use ----
+        {
+            Vec2 u = GetCursorScreenPos();
+            Dummy({ 440, 118 });
+            float uy = u.y;
+            // Cyrillic through the DEFAULT font (Segoe UI covers it)
+            draw->Text("\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82, \xD0\xBC\xD0\xB8\xD1\x80! (Cyrillic, default font)", { u.x, uy });
+            uy += 22;
+            // Chinese through an explicit CJK font
+            if (IsValid(cjkFont))
+                draw->Text(cjkFont, "\xE4\xB8\xAD\xE6\x96\x87\xE6\xB8\xB2\xE6\x9F\x93\xE6\xB5\x8B\xE8\xAF\x95 \xE4\xBD\xA0\xE5\xA5\xBD\xEF\xBC\x8C\xE4\xB8\x96\xE7\x95\x8C", { u.x, uy }, COL32(180, 235, 190));
+            uy += 26;
+            // icon font: PUA codepoints via EncodeUtf8
+            if (IsValid(iconFont)) {
+                static const uint32_t icons[] = { 0xE700, 0xE706, 0xE713, 0xE734, 0xE77B, 0xE8FB };
+                float ix = u.x;
+                for (uint32_t ic : icons) {
+                    char b[5];
+                    EncodeUtf8(ic, b);
+                    draw->Text(iconFont, b, { ix, uy }, COL32(140, 200, 255));
+                    ix += 34;
+                }
+                draw->Text("<- Segoe MDL2 icons (PUA)", { ix + 8, uy + 4 });
+            }
+            uy += 34;
+            // CJK word wrap (breaks between ideographs)
+            if (IsValid(cjkFont)) {
+                prim32::Rect ubox{ u.x, uy, 200, 30 };
+                TextOptions uo; uo.wrapWidth = 192; uo.clip = true;
+                draw->Text(cjkFont, "\xE8\xBF\x99\xE6\xAE\xB5\xE4\xB8\xAD\xE6\x96\x87\xE6\x96\x87\xE6\x9C\xAC\xE4\xBC\x9A\xE8\x87\xAA\xE5\x8A\xA8\xE6\x8D\xA2\xE8\xA1\x8C", ubox, uo);
+            }
+        }
 
         Vec2 m = MeasureText("MeasureText sample");
         Vec2 isz = GetImageSize(memImg);
