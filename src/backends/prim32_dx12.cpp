@@ -632,6 +632,10 @@ void Shutdown() {
     for (uint32_t i = 0; i < 256; i++) SafeRelease(S.cache[i].res);
     for (uint32_t i = 0; i < S.deadCount; i++) SafeRelease(S.dead[i].res);
     S.deadCount = 0;
+    for (uint32_t i = 0; i < S.texUpdCount; i++) free(S.texUpd[i].pixels);
+    free(S.texUpd);
+    S.texUpd = nullptr;
+    S.texUpdCount = S.texUpdCap = 0;
     for (uint32_t i = 0; i < S.numFrames; i++) SafeRelease(S.frames[i].buf);
     SafeRelease(S.queryReadback); SafeRelease(S.queryHeap);
     for (uint32_t i = 0; i < 64; i++) if (S.texRes[i].owned) SafeRelease(S.texRes[i].res);

@@ -57,9 +57,17 @@ bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx
     }
     fa->rasterA = face;
     fa->rasterB = copy;
-    fa->ascent     = (float)(face->size->metrics.ascender >> 6);
-    fa->descent    = (float)(-(face->size->metrics.descender >> 6));
-    fa->lineHeight = (float)(face->size->metrics.height >> 6);
+    // FreeType reports 26.6 metrics. Truncating them puts hinted bitmap rows
+    // outside the nominal line box at small sizes, clipping capitals and
+    // descenders. Round out and reserve one pixel above/below each line.
+    FT_Pos asc = face->size->metrics.ascender;
+    FT_Pos desc = -face->size->metrics.descender;
+    FT_Pos height = face->size->metrics.height;
+    fa->ascent = (float)((asc + 63) >> 6) + 1.0f;
+    fa->descent = (float)((desc + 63) >> 6) + 1.0f;
+    fa->lineHeight = (float)((height + 63) >> 6);
+    if (fa->lineHeight < fa->ascent + fa->descent)
+        fa->lineHeight = fa->ascent + fa->descent;
     fa->size       = sizePx;
 
     // kerning table for Latin pairs (matches the binary-searched BMP table)
@@ -89,7 +97,11 @@ bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx
         }
         fa->kernCount = m;
     }
-    return Prim32AtlasInit(fa, sizePx);
+    if (!Prim32AtlasInit(fa, sizePx)) {
+        Prim32RasterFreeFT(fa);
+        return false;
+    }
+    return true;
 }
 
 bool Prim32RasterGlyphFT(FontAtlas* fa, uint32_t cp, GlyphBitmap* out) {

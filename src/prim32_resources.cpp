@@ -112,7 +112,11 @@ ResourceStats GetResourceStats() {
     for (uint32_t i = 1; i < MAX_IMAGES; i++)
         if (s_images[i].used) { st.images++; st.textureBytes += s_images[i].bytes; }
     for (uint32_t i = 1; i < MAX_FONTS; i++)
-        if (s_fonts[i].used) { st.fonts++; st.atlasBytes += s_fonts[i].bytes; }
+        if (s_fonts[i].used) {
+            st.fonts++;
+            FontAtlas* a = s_fonts[i].atlas;
+            st.atlasBytes += a ? (uint64_t)a->pageW * a->pageH * a->pageCount : s_fonts[i].bytes;
+        }
     return st;
 }
 
@@ -191,7 +195,9 @@ static uint8_t* Scratch(uint8_t** buf, size_t* cap, size_t need) {
     if (need > *cap) {
         size_t n = *cap ? *cap : 4096;
         while (n < need) n *= 2;
-        *buf = (uint8_t*)realloc(*buf, n);
+        uint8_t* resized = (uint8_t*)realloc(*buf, n);
+        if (!resized) return nullptr;
+        *buf = resized;
         *cap = n;
     }
     return *buf;
@@ -207,22 +213,37 @@ bool Prim32RasterGlyphGDI(FontAtlas* fa, uint32_t cp, GlyphBitmap* out) {
     DWORD sz = GetGlyphOutlineW(dc, (UINT)cp, GGO_GRAY8_BITMAP, &gm, 0, nullptr, &mat);
     if (sz == GDI_ERROR) return false;
     int w = (int)gm.gmBlackBoxX, h = (int)gm.gmBlackBoxY;
-    out->advance  = (float)gm.gmCellIncX;
-    out->bearingX = gm.gmptGlyphOrigin.x;
-    out->bearingY = gm.gmptGlyphOrigin.y;
+    int scale = fa->rasterScale > 0 ? fa->rasterScale : 1;
+    out->advance  = (float)gm.gmCellIncX / scale;
+    out->bearingX = gm.gmptGlyphOrigin.x / scale;
+    out->bearingY = gm.gmptGlyphOrigin.y / scale;
     out->w = 0; out->h = 0; out->pixels = nullptr; out->pitch = 0;
     if (!sz || w <= 0 || h <= 0) return true;          // advance-only (space etc.)
     uint8_t* raw = Scratch(&s_ggoBuf, &s_ggoCap, sz);
+    if (!raw) return false;
     GLYPHMETRICS gm2;
     if (GetGlyphOutlineW(dc, (UINT)cp, GGO_GRAY8_BITMAP, &gm2, sz, raw, &mat) == GDI_ERROR) return false;
     int pitch = (w + 3) & ~3;                          // GGO rows are DWORD aligned
-    uint8_t* a8 = Scratch(&s_a8Buf, &s_a8Cap, (size_t)w * h);
-    for (int r = 0; r < h; r++)
-        for (int x = 0; x < w; x++) {
-            uint32_t v = raw[(size_t)r * pitch + x] * 255u / 64u;   // 0..64 -> 0..255
-            a8[(size_t)r * w + x] = v > 255 ? 255 : (uint8_t)v;
+    int dw = (w + scale - 1) / scale, dh = (h + scale - 1) / scale;
+    uint8_t* a8 = Scratch(&s_a8Buf, &s_a8Cap, (size_t)dw * dh);
+    if (!a8) return false;
+    // Rasterize at 2x then box-filter to the requested size. Direct 9-15 px
+    // GDI bitmaps visibly stair-step; the filtered coverage preserves the
+    // existing logical metrics while giving the atlas a smooth edge ramp.
+    for (int r = 0; r < dh; r++)
+        for (int x = 0; x < dw; x++) {
+            int y0 = r * scale, y1 = y0 + scale; if (y1 > h) y1 = h;
+            int x0 = x * scale, x1 = x0 + scale; if (x1 > w) x1 = w;
+            uint32_t sum = 0, count = 0;
+            for (int sy = y0; sy < y1; sy++)
+                for (int sx = x0; sx < x1; sx++) {
+                    sum += raw[(size_t)sy * pitch + sx] * 255u / 64u;
+                    count++;
+                }
+            uint32_t v = count ? (sum + count / 2) / count : 0;
+            a8[(size_t)r * dw + x] = v > 255 ? 255 : (uint8_t)v;
         }
-    out->w = w; out->h = h; out->pixels = a8; out->pitch = w;
+    out->w = dw; out->h = dh; out->pixels = a8; out->pitch = dw;
     return true;
 }
 
@@ -240,7 +261,8 @@ static void RasterKernGDI(FontAtlas* fa) {
         for (DWORD k = 0; k < n; k++)
             if (kp[k].iKernAmount) {
                 fa->kernKeys[m] = ((uint32_t)kp[k].wFirst << 16) | kp[k].wSecond;
-                fa->kernVals[m] = (float)kp[k].iKernAmount; m++;
+                int scale = fa->rasterScale > 0 ? fa->rasterScale : 1;
+                fa->kernVals[m] = (float)kp[k].iKernAmount / scale; m++;
             }
         fa->kernCount = m;
         for (uint32_t a = 1; a < m; a++) {             // insertion sort (nearly sorted)
@@ -366,6 +388,7 @@ bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
                        const wchar_t* face, float sizePx, bool kerning) {
     memset(fa, 0, sizeof(*fa));
     fa->rasterKind = 0;
+    fa->rasterScale = 2;
     if (data) {                                        // memory font: GDI copies the bytes
         DWORD installed = 0;
         HANDLE mem = AddFontMemResourceEx((PVOID)data, (DWORD)size, nullptr, &installed);
@@ -373,7 +396,9 @@ bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
         fa->rasterC = mem;                             // kept until FreeFontAtlas (lazy raster!)
     }
     HDC dc = CreateCompatibleDC(nullptr);
-    HFONT font = CreateFontW(-(int)(sizePx + 0.5f), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+    // FW_NORMAL becomes a fragile one-pixel stroke at the framework's 9-15 px
+    // sizes. Semibold keeps small text readable without full-bold heaviness.
+    HFONT font = CreateFontW(-(int)(sizePx * fa->rasterScale + 0.5f), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                              ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
     if (!dc || !font) {
@@ -385,11 +410,16 @@ bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
     SelectObject(dc, font);
     fa->rasterA = dc; fa->rasterB = font;
     TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
-    fa->ascent = (float)tm.tmAscent; fa->descent = (float)tm.tmDescent;
-    fa->lineHeight = (float)(tm.tmHeight + tm.tmExternalLeading);
+    fa->ascent = (float)tm.tmAscent / fa->rasterScale;
+    fa->descent = (float)tm.tmDescent / fa->rasterScale;
+    fa->lineHeight = (float)(tm.tmHeight + tm.tmExternalLeading) / fa->rasterScale;
     fa->size = sizePx;
     if (kerning) RasterKernGDI(fa);
-    return Prim32AtlasInit(fa, sizePx);
+    if (!Prim32AtlasInit(fa, sizePx)) {
+        Prim32FreeFontAtlas(fa);
+        return false;
+    }
+    return true;
 }
 
 void Prim32FreeFontAtlas(FontAtlas* fa) {

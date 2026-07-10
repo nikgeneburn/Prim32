@@ -154,6 +154,7 @@ struct FontAtlas {
     // rasterizer binding (GDI: dc/font/memHandle — FreeType: library/face/data)
     void* rasterA; void* rasterB; void* rasterC;
     int   rasterKind;                // 0 = GDI, 1 = FreeType
+    int   rasterScale;               // GDI supersampling factor; 1 = native
 };
 
 // Encode one codepoint as UTF-8 (for icon fonts: EncodeUtf8(0xE700, buf)).

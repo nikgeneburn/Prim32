@@ -152,6 +152,7 @@ src/
     prim32.cpp
     prim32_internal.h
     prim32_resources.cpp
+    prim32_freetype.cpp
     backends/
         prim32_dx12.cpp
     profiler/
@@ -256,7 +257,7 @@ The current Windows implementation uses:
 - D3D12
 - DXGI
 - D3DCompiler
-- GDI for font rasterization (FreeType optional)
+- GDI fallback rasterizer and optional FreeType rasterizer
 - WIC for image decoding
 - PDH for per-process GPU utilization
 - PSAPI for process memory statistics
