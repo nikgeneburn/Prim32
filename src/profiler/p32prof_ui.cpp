@@ -124,11 +124,17 @@ void ShowProfiler(Context* c, bool* open, const char* extraInfo) {
         DrawRect(c, p.x, p.y, p.x + gw, p.y + gh, COL32(12, 13, 17, 255));
         float mx = 0.001f;
         for (int i = 0; i < n; i++) if (h[i] > mx) mx = h[i];
-        float barW = gw / 240.0f;
-        for (int i = 0; i < n; i++) {
-            float v = h[i] / mx;
+        // A 120-column max-downsample keeps spikes visible while halving the
+        // profiler's graph primitives when its 240-frame history is full.
+        const int columns = n < 120 ? n : 120;
+        float barW = gw / (columns > 0 ? columns : 1);
+        for (int i = 0; i < columns; i++) {
+            int begin = i * n / columns, end = (i + 1) * n / columns;
+            float sample = 0;
+            for (int j = begin; j < end; j++) if (h[j] > sample) sample = h[j];
+            float v = sample / mx;
             DrawRect(c, p.x + i * barW, p.y + gh * (1 - v), p.x + i * barW + barW, p.y + gh,
-                     HeatCol(h[i] / (mx > 33.3f ? mx : 33.3f) * 2.0f));
+                     HeatCol(sample / (mx > 33.3f ? mx : 33.3f) * 2.0f));
         }
         DrawRectStroke(c, p.x, p.y, p.x + gw, p.y + gh, c->style.colors[ZC_Border], 0, 1);
         char lbl[64]; snprintf(lbl, 64, "%.1f ms", mx);
@@ -166,6 +172,8 @@ void ShowProfiler(Context* c, bool* open, const char* extraInfo) {
                   md.ramMBperMin, md.vramMBperMin, md.spanSec, bad ? "  <- investigate" : "  steady");
         } else if (md.hasStep) {
             TextColored(c->style.colors[ZC_TextDim], "LEAK verdict pending (collecting post-step samples)");
+        } else if (md.spanSec > 0) {
+            TextColored(c->style.colors[ZC_TextDim], "LEAK verdict needs a stable 60 s baseline");
         }
     }
     TextColored(c->style.colors[ZC_TextDim], GetAdapterName());

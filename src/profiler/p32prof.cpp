@@ -400,7 +400,10 @@ MemDrift GetMemDrift() {
     d.ramMBperMin  = (float)((m * sxy - sx * sy) / den * 60.0);
     d.vramMBperMin = (float)((m * sxz - sx * sz) / den * 60.0);
     d.spanSec = last.t - at(start).t;
-    d.valid = d.spanSec > 4.0f;
+    // DXGI's current-usage value moves as the driver trims and expands its
+    // residency cache. A minute of samples filters that normal churn before
+    // we call a linear trend a leak.
+    d.valid = d.spanSec >= 60.0f;
     return d;
 }
 const ProcStats& GetProcStats() { return s_ps; }
@@ -526,8 +529,10 @@ int Dump(char* buf, int cap, const char* extraInfo) {
                      md.stepRamMB, md.stepVramMB, md.stepAgoSec);
         if (md.valid)
             at = Put(buf, cap, at, "LEAK : RAM drift %+.2f MB/min | VRAM drift %+.2f MB/min  (over %.0f s)%s\n",
-                     md.ramMBperMin, md.vramMBperMin, md.spanSec,
-                     (md.ramMBperMin > 1.0f || md.vramMBperMin > 4.0f) ? "  <-- INVESTIGATE" : "  (steady)");
+                      md.ramMBperMin, md.vramMBperMin, md.spanSec,
+                      (md.ramMBperMin > 1.0f || md.vramMBperMin > 4.0f) ? "  <-- INVESTIGATE" : "  (steady)");
+        else if (md.spanSec > 0)
+            at = Put(buf, cap, at, "LEAK : collecting a stable 60 s baseline (%.0f s so far)\n", md.spanSec);
         else if (md.hasStep)
             at = Put(buf, cap, at, "LEAK : (waiting for post-step samples)\n");
     }
