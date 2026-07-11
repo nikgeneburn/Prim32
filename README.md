@@ -6,6 +6,8 @@
 
 Prim32 is a raw, high-throughput immediate-mode GUI and 2D rendering framework built specifically for Direct3D 12.
 
+![Prim32 benchmark and profiler showcase](image.png)
+
 It keeps the familiar programming model of libraries such as Dear ImGui while replacing the traditional CPU-generated vertex and index pipeline with a compact GPU-driven primitive stream.
 
 Every drawable is represented by one fixed 32-byte primitive:
