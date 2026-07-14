@@ -12,6 +12,7 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
 endif()
 
 option(PRIM32_BUILD_EXAMPLES "Build the Prim32 D3D12 demo" ${PRIM32_IS_TOP_LEVEL})
+option(PRIM32_BUILD_TESTS "Build the headless Prim32 core tests" ${PRIM32_IS_TOP_LEVEL})
 
 set(PRIM32_PUBLIC_HEADERS
     include/prim32/prim32.h
@@ -21,9 +22,11 @@ set(PRIM32_PUBLIC_HEADERS
 
 set(PRIM32_SOURCES
     src/prim32.cpp
+    src/prim32_state.cpp
     src/prim32_resources.cpp
     src/prim32_freetype.cpp
     src/prim32_internal.h
+    src/prim32_state.h
     src/backends/prim32_dx12.cpp
     src/profiler/p32prof.cpp
     src/profiler/p32prof_ui.cpp
@@ -94,6 +97,25 @@ if(PRIM32_BUILD_EXAMPLES)
         OUTPUT_NAME Prim32Demo
         FOLDER Prim32/Examples
     )
+endif()
+
+if(PRIM32_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(prim32_core_tests
+        tests/core_tests.cpp
+        src/prim32_state.cpp
+    )
+    target_compile_features(prim32_core_tests PRIVATE cxx_std_17)
+    target_include_directories(prim32_core_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    set_target_properties(prim32_core_tests PROPERTIES
+        FOLDER Prim32/Tests
+    )
+
+    add_test(NAME prim32_core_tests COMMAND prim32_core_tests)
 endif()
 
 include(GNUInstallDirs)

@@ -32,7 +32,7 @@ Glyph*      Prim32GetGlyph(FontAtlas* fa, uint32_t cp);
 // Atlas + rasterizer lifecycle (prim32_resources.cpp)
 bool Prim32AtlasInit(FontAtlas* fa, float sizePx);                   // pool, maps, page 0, notdef
 bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size, // data==null -> system face
-                       const wchar_t* face, float sizePx, bool kerning);
+                        const wchar_t* face, float sizePx, int weight, bool kerning);
 #ifdef PRIM32_HAS_FREETYPE
 bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx, bool kerning);
 bool Prim32RasterGlyphFT(FontAtlas* fa, uint32_t cp, GlyphBitmap* out);

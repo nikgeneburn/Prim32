@@ -527,14 +527,16 @@ PRIM32_API void  PopID();
 // On failure they return the Invalid handle; see GetLastResourceError().
 PRIM32_API ImageHandle LoadImageFromFile(const char* path);                     // PNG/JPG/BMP/GIF/TIFF (WIC)
 PRIM32_API ImageHandle LoadImageFromMemory(const void* data, size_t size);      // encoded bytes
+PRIM32_API ImageHandle LoadImageFromRgba(const void* pixels, int width, int height);
 PRIM32_API void        DestroyImage(ImageHandle image);
 PRIM32_API bool        IsValid(ImageHandle image);
 PRIM32_API Vec2        GetImageSize(ImageHandle image);
 
 PRIM32_API FontHandle  LoadFontFromFile(const char* path, float sizePixels);    // TTF/OTF/TTC
-PRIM32_API FontHandle  LoadFontFromMemory(const void* data, size_t size, float sizePixels);
+PRIM32_API FontHandle  LoadFontFromMemory(const void* data, size_t size, float sizePixels, int weight = 400);
 PRIM32_API void        DestroyFont(FontHandle font);
 PRIM32_API bool        IsValid(FontHandle font);
+PRIM32_API int         GetFontRasterizer(FontHandle font); // 0 = GDI, 1 = FreeType, -1 = invalid
 
 // Font selection for draw->Text(...) without an explicit font:
 //   1. explicit font argument   2. PushFont stack top

@@ -69,7 +69,7 @@ struct ProcStats {
     double   vramMB, vramBudgetMB, sharedMB, sharedBudgetMB;
     bool     vramValid;
 };
-void             SampleProcess();        // call every frame; ~2 Hz internally
+void             SampleProcess();        // call every frame; sampled asynchronously at ~2 Hz
 // Leak detector: linear drift of private bytes / VRAM over the sample ring.
 struct MemDrift {
     float ramMBperMin, vramMBperMin, spanSec;

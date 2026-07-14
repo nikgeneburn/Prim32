@@ -359,15 +359,11 @@ if (!prim32_dx12::Init(context, backendDesc))
 ```cpp
 prim32::FrameMem frameMem = prim32_dx12::NewFrame();
 
-prim32::IO io = {};
-io.displaySize = {
-    static_cast<float>(width),
-    static_cast<float>(height)
-};
-io.mousePos = mousePosition;
-io.mouseDown[0] = leftMouseDown;
-io.mouseWheel = mouseWheel;
-io.deltaTime = deltaTime;
+prim32::IO io = prim32::PollWin32Input(
+    hwnd,
+    { static_cast<float>(width), static_cast<float>(height) },
+    deltaTime
+);
 
 prim32::NewFrame(frameMem, io);
 
@@ -392,6 +388,77 @@ prim32::End();
 prim32::DrawData* drawData = prim32::EndFrame();
 prim32_dx12::Render(drawData, commandList);
 ```
+
+## Input and keybinds
+
+`PollWin32Input` is the quickest integration path. It polls all 256 Win32
+virtual-key codes with `GetAsyncKeyState` and obtains pointer position with
+`GetCursorPos`; passing your `HWND` converts the pointer to client
+coordinates. It installs no hook, no global hotkey, and no window callback.
+
+After `NewFrame`, use the input helpers anywhere in UI code:
+
+```cpp
+using namespace prim32;
+
+if (IsKeyPressed(KEY_F1))
+{
+    showHelp = !showHelp;
+}
+
+if (IsKeyPressed(KeyChord{ KEY_S, true })) // Ctrl+S
+{
+    SaveDocument();
+}
+
+if (IsMouseClicked(MOUSE_4)) // first side button
+{
+    NavigateBack();
+}
+
+if (IsMouseDown(MOUSE_1))
+{
+    Vec2 position = GetMousePos();
+    Vec2 movement = GetMouseDelta();
+    PanCanvas(position, movement);
+}
+```
+
+Available state queries are `IsKeyDown`, `IsKeyPressed`, `IsKeyReleased`,
+`IsMouseDown`, `IsMouseClicked`, `IsMouseReleased`, `GetMousePos`,
+`GetMouseDelta`, and `GetMouseWheel`. `KEY_MOUSE_1` through `KEY_MOUSE_5`
+can also be used with the key queries. `KEY_A` through `KEY_Z`, function
+keys, navigation keys, modifiers, and common keypad keys are named; any
+other Win32 virtual-key code can be cast to `prim32::Key`.
+
+Mouse-wheel movement is event-based in Win32 rather than a persistent state.
+If you need it, keep the per-frame delta from `WM_MOUSEWHEEL` and assign it
+to `IO::mouseWheel` before calling `NewFrame`; reset that accumulator after
+the frame. Manual `IO` population remains fully supported for applications
+with their own platform layer.
+
+## Child Regions And Scrolling
+
+`BeginChild` creates a clipped, nested layout region with scroll position
+stored by ID. Content receives wheel input when hovered, and the deepest child
+that can move consumes the wheel before its parent.
+
+```cpp
+if (prim32::BeginChild("Log", { 420.0f, 220.0f }, prim32::CF_Border))
+{
+    for (int i = 0; i < logCount; ++i)
+    {
+        prim32::Text(logLines[i]);
+    }
+
+    prim32::EndChild();
+}
+```
+
+Use `GetScrollX`, `GetScrollY`, `SetScrollX`, and `SetScrollY` while a child
+is active; call the setters before emitting that child’s content. Zero width or height makes that axis fill the remaining parent
+content area. `CF_AlwaysVerticalScrollbar` shows a scrollbar even
+when all content fits; `CF_NoBackground` and `CF_Border` control decoration.
 
 After submitting the command list:
 

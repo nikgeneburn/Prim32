@@ -48,9 +48,7 @@ static UINT                       g_frame;
 static bool                       g_tearing;
 static int                        g_width = 1680, g_height = 945;
 static bool                       g_occluded;
-
-// ---------------------------------------------------------------------- input
-static IO g_io;
+static float                      g_mouseWheel;
 
 static void WaitIdle() {
     g_queue->Signal(g_fence, ++g_fenceCounter);
@@ -533,6 +531,20 @@ static void ShowDrawListDemo(Context* c) {
     End();
 }
 
+// ---------------------------------------------------------- child scroll demo
+static void ShowChildDemo() {
+    SetNextWindowPos({ 500, 640 });
+    if (Begin("Child regions##child", WF_AutoSize)) {
+        Text("Wheel over the log to scroll it.");
+        if (BeginChild("Event log", { 360, 150 }, CF_Border)) {
+            for (int i = 0; i < 40; i++)
+                TextF("event %02d: persistent child scroll state", i + 1);
+            EndChild();
+        }
+    }
+    End();
+}
+
 // -------------------------------------------------------------------- main UI
 static void BuildUI(Context* c, float time, float fps, float frameMs) {
     {   P32PROF_SCOPE("Stress payload");
@@ -618,6 +630,7 @@ static void BuildUI(Context* c, float time, float fps, float frameMs) {
     {   P32PROF_SCOPE("DrawList demo");
         ShowDrawListDemo(c);
     }
+    ShowChildDemo();
 
     {   // foreground layer: arbitrary drawing above ALL windows
         BeginLayer(LAYER_FOREGROUND);
@@ -658,17 +671,12 @@ static void BuildUI(Context* c, float time, float fps, float frameMs) {
 // ------------------------------------------------------------------- win proc
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
-    case WM_MOUSEMOVE:   g_io.mousePos = { (float)(short)LOWORD(lp), (float)(short)HIWORD(lp) }; return 0;
-    case WM_LBUTTONDOWN: SetCapture(h); g_io.mouseDown[0] = true;  return 0;
-    case WM_LBUTTONUP:   ReleaseCapture(); g_io.mouseDown[0] = false; return 0;
-    case WM_RBUTTONDOWN: g_io.mouseDown[1] = true;  return 0;
-    case WM_RBUTTONUP:   g_io.mouseDown[1] = false; return 0;
-    case WM_MBUTTONDOWN: g_io.mouseDown[2] = true;  return 0;
-    case WM_MBUTTONUP:   g_io.mouseDown[2] = false; return 0;
-    case WM_MOUSEWHEEL:  g_io.mouseWheel += GET_WHEEL_DELTA_WPARAM(wp) / 120.0f; return 0;
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) Resize(LOWORD(lp), HIWORD(lp));
         g_occluded = wp == SIZE_MINIMIZED;
+        return 0;
+    case WM_MOUSEWHEEL:
+        g_mouseWheel += GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11) {
@@ -811,13 +819,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         prim32_dx12::GpuZoneEnd(g_cl);
 
         // ---- Prim32 frame
-        g_io.displaySize = { (float)g_width, (float)g_height };
-        g_io.deltaTime = dt;
+        IO io = PollWin32Input(g_hwnd, { (float)g_width, (float)g_height }, dt);
+        io.mouseWheel = g_mouseWheel;
+        g_mouseWheel = 0;
         {
             P32PROF_SCOPE("Prim32 NewFrame");
-            NewFrame(mem, g_io);
+            NewFrame(mem, io);
         }
-        g_io.mouseWheel = 0;
         {
             P32PROF_SCOPE("BuildUI");
             BuildUI(ctx, time, fps, frameMs);

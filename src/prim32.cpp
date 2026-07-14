@@ -336,8 +336,8 @@ Context* CreateContext(const FontDesc* fd) {
     c->style.Dark();
     FontDesc def = { L"Segoe UI", 17.0f, true };
     if (!fd) fd = &def;
-    if (!Prim32FontInitGDI(&c->font, nullptr, 0, fd->face, fd->sizePx, fd->kerning)) {
-        Prim32FontInitGDI(&c->font, nullptr, 0, L"Arial", fd->sizePx, fd->kerning);
+    if (!Prim32FontInitGDI(&c->font, nullptr, 0, fd->face, fd->sizePx, FW_NORMAL, fd->kerning)) {
+        Prim32FontInitGDI(&c->font, nullptr, 0, L"Arial", fd->sizePx, FW_NORMAL, fd->kerning);
     }
     Prim32PrewarmAscii(&c->font);   // first frame never rasterizes basic Latin
     c->drawList.ctx = c;

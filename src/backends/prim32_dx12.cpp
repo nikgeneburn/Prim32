@@ -33,6 +33,8 @@ template <class T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = n
 
 static const uint32_t CLIP_BYTES = 64 * 1024;          // 4096 clip rects
 static const uint32_t MAX_FRAMES = 4;
+static const uint32_t MAX_TEXTURES = 256;
+static const uint32_t MAX_DEAD_RESOURCES = 512;
 static const uint32_t MAX_GPU_ZONES = 40;              // per frame
 static const uint32_t TS_PER_FRAME  = MAX_GPU_ZONES * 2;
 
@@ -43,7 +45,7 @@ cbuffer CB : register(b0) { float2 uScale; float2 uOffset; uint uBase; uint uCli
 struct Prim { float4 rect; uint uv0; uint uv1; uint color; uint meta; };
 StructuredBuffer<Prim>   Prims : register(t0);
 StructuredBuffer<float4> Clips : register(t1);
-Texture2D    Tex[64] : register(t0, space1);
+Texture2D    Tex[256] : register(t0, space1);
 SamplerState SLin    : register(s0);
 
 #define T_RECT      0
@@ -213,15 +215,15 @@ static struct {
     struct TexUpd { uint32_t slot; int x, y, w, h; uint8_t* pixels; };
     TexUpd*                  texUpd;
     uint32_t                 texUpdCount, texUpdCap;
-    TexRes                   texRes[64];
-    uint16_t                 freeSlots[64];
+    TexRes                   texRes[MAX_TEXTURES];
+    uint16_t                 freeSlots[MAX_TEXTURES];
     uint32_t                 freeCount;
     uint64_t                 texBytes;
     // cached-layer VRAM blocks (indexed by CachedLayer::id)
     struct CacheBlock { ID3D12Resource* res; D3D12_GPU_VIRTUAL_ADDRESS va; uint32_t cap; uint32_t version; };
     CacheBlock               cache[256];
     struct DeadRes { ID3D12Resource* res; uint64_t fence; };
-    DeadRes                  dead[64];
+    DeadRes                  dead[MAX_DEAD_RESOURCES];
     uint32_t                 deadCount;
     uint64_t                 cacheBytes;
 } S;
@@ -371,14 +373,14 @@ static uint32_t CreateTexture2D(const void* pixels, int w, int h, int fmt, const
     ID3D12Resource* tex = nullptr;
     if (FAILED(S.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
         D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex)))) {
-        if (S.freeCount < 64) S.freeSlots[S.freeCount++] = (uint16_t)slot;
+        if (S.freeCount < MAX_TEXTURES) S.freeSlots[S.freeCount++] = (uint16_t)slot;
         return 0xFFFFFFFFu;
     }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; UINT64 total = 0; UINT rows; UINT64 rowBytes;
     S.device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &rowBytes, &total);
 
     ID3D12Resource* up = CreateBuffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!up) { tex->Release(); if (S.freeCount < 64) S.freeSlots[S.freeCount++] = (uint16_t)slot; return 0xFFFFFFFFu; }
+    if (!up) { tex->Release(); if (S.freeCount < MAX_TEXTURES) S.freeSlots[S.freeCount++] = (uint16_t)slot; return 0xFFFFFFFFu; }
     uint8_t* dst = nullptr; D3D12_RANGE rr = { 0, 0 };
     up->Map(0, &rr, (void**)&dst);
     for (UINT r = 0; r < rows; r++)
@@ -434,8 +436,8 @@ static uint32_t HookCreateTexture(const void* px, int w, int h, int fmt, const c
     return CreateTexture2D(px, w, h, fmt, name);
 }
 static void HookDestroyTexture(uint32_t slot) {
-    if (slot >= 64 || !S.texRes[slot].res || !S.texRes[slot].owned) return;
-    if (S.deadCount < 64) {
+    if (slot >= MAX_TEXTURES || !S.texRes[slot].res || !S.texRes[slot].owned) return;
+    if (S.deadCount < MAX_DEAD_RESOURCES) {
         S.dead[S.deadCount++] = { S.texRes[slot].res, S.fenceCounter + 1 };
     } else {                                   // dead list full (rare): drain
         S.queue->Signal(S.fence, ++S.fenceCounter);
@@ -447,12 +449,12 @@ static void HookDestroyTexture(uint32_t slot) {
     p32prof::TrackMem("gpu: textures (fonts+images)", S.texBytes);
     S.texRes[slot] = {};
     WriteNullSrv(slot);
-    if (S.freeCount < 64) S.freeSlots[S.freeCount++] = (uint16_t)slot;
+    if (S.freeCount < MAX_TEXTURES) S.freeSlots[S.freeCount++] = (uint16_t)slot;
 }
 // Queue a region update; pixels are copied NOW (tight pitch), uploaded at the
 // start of the next Render on the app's command list.
 static void HookUpdateTexture(uint32_t slot, int x, int y, int w, int h, const uint8_t* pixels, int pitch) {
-    if (slot >= 64 || w <= 0 || h <= 0) return;
+    if (slot >= MAX_TEXTURES || w <= 0 || h <= 0) return;
     if (S.texUpdCount == S.texUpdCap) {
         uint32_t nc = S.texUpdCap ? S.texUpdCap * 2 : 64;
         void* np = realloc(S.texUpd, nc * sizeof(*S.texUpd));
@@ -481,8 +483,8 @@ static void FlushTextureUpdates(ID3D12GraphicsCommandList* cmd) {
     uint8_t* map = nullptr; D3D12_RANGE rr = { 0, 0 };
     up->Map(0, &rr, (void**)&map);
 
-    bool touched[64] = {};
-    D3D12_RESOURCE_BARRIER bars[64]; uint32_t nb = 0;
+    bool touched[MAX_TEXTURES] = {};
+    D3D12_RESOURCE_BARRIER bars[MAX_TEXTURES]; uint32_t nb = 0;
     for (uint32_t i = 0; i < S.texUpdCount; i++) {
         uint32_t sl = S.texUpd[i].slot;
         if (touched[sl] || !S.texRes[sl].res) continue;
@@ -527,7 +529,7 @@ static void FlushTextureUpdates(ID3D12GraphicsCommandList* cmd) {
         bars[i].Transition.StateAfter = t;
     }
     if (nb) cmd->ResourceBarrier(nb, bars);
-    if (S.deadCount < 64) S.dead[S.deadCount++] = { up, S.fenceCounter + 1 };
+    if (S.deadCount < MAX_DEAD_RESOURCES) S.dead[S.deadCount++] = { up, S.fenceCounter + 1 };
     else up->Release();
     S.texUpdCount = 0;
 }
@@ -554,7 +556,8 @@ bool Init(prim32::Context* ctx, const InitDesc& desc) {
     S.numFrames = desc.framesInFlight ? desc.framesInFlight : 3;
     if (S.numFrames > MAX_FRAMES) S.numFrames = MAX_FRAMES;
     S.maxPrims = desc.maxPrims ? desc.maxPrims : (1u << 20);
-    S.maxTextures = 64;   // fixed: matches shader-side Tex[64]
+    S.maxTextures = desc.maxTextures ? desc.maxTextures : MAX_TEXTURES;
+    if (S.maxTextures > MAX_TEXTURES) S.maxTextures = MAX_TEXTURES;
     S.srvStride = S.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     if (FAILED(S.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&S.fence)))) return false;
@@ -638,7 +641,7 @@ void Shutdown() {
     S.texUpdCount = S.texUpdCap = 0;
     for (uint32_t i = 0; i < S.numFrames; i++) SafeRelease(S.frames[i].buf);
     SafeRelease(S.queryReadback); SafeRelease(S.queryHeap);
-    for (uint32_t i = 0; i < 64; i++) if (S.texRes[i].owned) SafeRelease(S.texRes[i].res);
+    for (uint32_t i = 0; i < S.maxTextures; i++) if (S.texRes[i].owned) SafeRelease(S.texRes[i].res);
     SafeRelease(S.fontTex); SafeRelease(S.srvHeap);
     SafeRelease(S.pso); SafeRelease(S.rootSig);
     SafeRelease(S.fence);
@@ -719,7 +722,7 @@ void Render(prim32::DrawData* dd, ID3D12GraphicsCommandList* cmd) {
         uint64_t bytes = (uint64_t)cl->primCount * sizeof(prim32::Prim);
         if (!bytes) continue;
         if (!b.res || b.cap < cl->primCount) {
-            if (b.res && S.deadCount < 64) {
+            if (b.res && S.deadCount < MAX_DEAD_RESOURCES) {
                 S.dead[S.deadCount++] = { b.res, S.fenceCounter + 1 };
                 S.cacheBytes -= (uint64_t)b.cap * sizeof(prim32::Prim);
             }
@@ -768,7 +771,7 @@ void Render(prim32::DrawData* dd, ID3D12GraphicsCommandList* cmd) {
         tb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(1, &tb);
-        if (S.deadCount < 64) {
+        if (S.deadCount < MAX_DEAD_RESOURCES) {
             S.dead[S.deadCount++] = { up, S.fenceCounter + 1 };
         } else {   // dead list full (rare): drain synchronously
             S.queue->Signal(S.fence, ++S.fenceCounter);

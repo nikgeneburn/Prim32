@@ -17,7 +17,8 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 cl /nologo /std:c++17 /O2 /Oi /Ot /GL /fp:fast /EHs-c- /GR- /DNDEBUG /DUNICODE /D_UNICODE ^
    /I"%ROOT%\include" ^
    /I"%ROOT%\src" ^
-   "%ROOT%\src\prim32.cpp" ^
+    "%ROOT%\src\prim32.cpp" ^
+    "%ROOT%\src\prim32_state.cpp" ^
    "%ROOT%\src\prim32_resources.cpp" ^
    "%ROOT%\src\prim32_freetype.cpp" ^
    "%ROOT%\src\backends\prim32_dx12.cpp" ^

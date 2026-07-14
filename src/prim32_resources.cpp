@@ -51,7 +51,7 @@ const Prim32BackendHooks* Prim32GetBackendHooks() { return s_hooks; }
 
 // ===== PRIM32_PURE_REG_BEGIN (no OS deps; extracted by the native tests) =====
 static const uint32_t MAX_IMAGES = 256;
-static const uint32_t MAX_FONTS  = 64;
+static const uint32_t MAX_FONTS  = 256;
 
 struct ImageRes {
     uint32_t gen;          // bumped on destroy; 0 = never used
@@ -101,6 +101,10 @@ static FontRes* RegGetFont(FontHandle h) {
 
 bool IsValid(ImageHandle h) { return RegGetImage(h) != nullptr; }
 bool IsValid(FontHandle h)  { return RegGetFont(h) != nullptr; }
+int GetFontRasterizer(FontHandle h) {
+    FontRes* r = RegGetFont(h);
+    return r && r->atlas ? r->atlas->rasterKind : -1;
+}
 
 Vec2 GetImageSize(ImageHandle h) {
     ImageRes* r = RegGetImage(h);
@@ -385,7 +389,7 @@ void Prim32PrewarmAscii(FontAtlas* fa) {
 
 // ---- font lifecycle
 bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
-                       const wchar_t* face, float sizePx, bool kerning) {
+                       const wchar_t* face, float sizePx, int weight, bool kerning) {
     memset(fa, 0, sizeof(*fa));
     fa->rasterKind = 0;
     fa->rasterScale = 2;
@@ -396,9 +400,7 @@ bool Prim32FontInitGDI(FontAtlas* fa, const void* data, size_t size,
         fa->rasterC = mem;                             // kept until FreeFontAtlas (lazy raster!)
     }
     HDC dc = CreateCompatibleDC(nullptr);
-    // FW_NORMAL becomes a fragile one-pixel stroke at the framework's 9-15 px
-    // sizes. Semibold keeps small text readable without full-bold heaviness.
-    HFONT font = CreateFontW(-(int)(sizePx * fa->rasterScale + 0.5f), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+    HFONT font = CreateFontW(-(int)(sizePx * fa->rasterScale + 0.5f), 0, 0, 0, weight, 0, 0, 0,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                              ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
     if (!dc || !font) {
@@ -491,7 +493,7 @@ static bool TtfFamilyName(const uint8_t* d, size_t n, wchar_t out[64]) {
 // ===== PRIM32_PURE_TTF_END =====
 
 // -------------------------------------------------------------- font loading
-FontHandle LoadFontFromMemory(const void* data, size_t size, float sizePixels) {
+FontHandle LoadFontFromMemory(const void* data, size_t size, float sizePixels, int weight) {
     s_lastErr[0] = 0;
     if (!data || size < 12)          { SetErr("LoadFontFromMemory: empty/short data"); return InvalidFontHandle; }
     if (sizePixels < 4 || sizePixels > 256) { SetErr("LoadFontFromMemory: bad size %.1f px", sizePixels); return InvalidFontHandle; }
@@ -516,7 +518,7 @@ FontHandle LoadFontFromMemory(const void* data, size_t size, float sizePixels) {
         SetErr("LoadFontFromMemory: could not parse font family name (not a TTF/OTF/TTC?)");
         return InvalidFontHandle;
     }
-    ok = Prim32FontInitGDI(atlas, data, size, family, sizePixels, true);
+    ok = Prim32FontInitGDI(atlas, data, size, family, sizePixels, weight, true);
     snprintf(rasterName, sizeof(rasterName), "gdi");
     if (!ok) SetErr("LoadFontFromMemory: GDI could not load the face");
 #endif
@@ -678,6 +680,22 @@ ImageHandle LoadImageFromMemory(const void* data, size_t size) {
     uint8_t* px = DecodeImageWIC(nullptr, data, size, &w, &h);
     if (!px) return InvalidImageHandle;
     return RegisterDecoded(px, w, h, "(memory image)");
+}
+
+ImageHandle LoadImageFromRgba(const void* pixels, int width, int height) {
+    s_lastErr[0] = 0;
+    if (!pixels || width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        SetErr("LoadImageFromRgba: invalid dimensions (%dx%d)", width, height);
+        return InvalidImageHandle;
+    }
+    const size_t bytes = (size_t)width * (size_t)height * 4;
+    uint8_t* copy = (uint8_t*)malloc(bytes);
+    if (!copy) {
+        SetErr("LoadImageFromRgba: out of memory");
+        return InvalidImageHandle;
+    }
+    memcpy(copy, pixels, bytes);
+    return RegisterDecoded(copy, width, height, "(rgba image)");
 }
 
 void DestroyImage(ImageHandle h) {

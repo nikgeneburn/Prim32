@@ -18,6 +18,7 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <prim32/prim32.h>
 #include "prim32_internal.h"
 
@@ -39,6 +40,7 @@ bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx
     (void)kerning;
     memset(fa, 0, sizeof(*fa));
     fa->rasterKind = 1;
+    fa->rasterScale = 1;
     if (!FtLib()) return false;
 
     void* copy = malloc(size);                 // FT_New_Memory_Face requires the
@@ -50,22 +52,20 @@ bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx
         free(copy);
         return false;
     }
-    if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)(sizePx + 0.5f)) != 0) {
+    if (FT_Set_Char_Size(face, 0, (FT_F26Dot6)(sizePx * 64.0f + 0.5f), 72, 72) != 0) {
         FT_Done_Face(face);
         free(copy);
         return false;
     }
     fa->rasterA = face;
     fa->rasterB = copy;
-    // FreeType reports 26.6 metrics. Truncating them puts hinted bitmap rows
-    // outside the nominal line box at small sizes, clipping capitals and
-    // descenders. Round out and reserve one pixel above/below each line.
     FT_Pos asc = face->size->metrics.ascender;
     FT_Pos desc = -face->size->metrics.descender;
     FT_Pos height = face->size->metrics.height;
-    fa->ascent = (float)((asc + 63) >> 6) + 1.0f;
-    fa->descent = (float)((desc + 63) >> 6) + 1.0f;
-    fa->lineHeight = (float)((height + 63) >> 6);
+    const float metricScale = 1.0f / (64.0f * fa->rasterScale);
+    fa->ascent = (float)asc * metricScale;
+    fa->descent = (float)desc * metricScale;
+    fa->lineHeight = (float)height * metricScale;
     if (fa->lineHeight < fa->ascent + fa->descent)
         fa->lineHeight = fa->ascent + fa->descent;
     fa->size       = sizePx;
@@ -90,7 +90,7 @@ bool Prim32FontInitFT(FontAtlas* fa, const void* data, size_t size, float sizePx
                         if (!fa->kernKeys || !fa->kernVals) break;
                     }
                     fa->kernKeys[m] = (a << 16) | b;   // already in ascending order
-                    fa->kernVals[m] = (float)(kv.x >> 6);
+                    fa->kernVals[m] = (float)kv.x * metricScale;
                     m++;
                 }
             }
@@ -109,16 +109,17 @@ bool Prim32RasterGlyphFT(FontAtlas* fa, uint32_t cp, GlyphBitmap* out) {
     if (!face) return false;
     FT_UInt gi = FT_Get_Char_Index(face, (FT_ULong)cp);
     if (!gi) return false;                     // no glyph -> caller uses notdef
-    if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0) return false;
+    if (FT_Load_Glyph(face, gi, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) != 0) return false;
     FT_GlyphSlot g = face->glyph;
-    out->w        = (int)g->bitmap.width;
-    out->h        = (int)g->bitmap.rows;
+    if (g->bitmap.pitch < 0) return false;
+    out->w = (int)g->bitmap.width;
+    out->h = (int)g->bitmap.rows;
     out->bearingX = g->bitmap_left;
     out->bearingY = g->bitmap_top;
-    out->advance  = (float)(g->advance.x >> 6);
-    out->pixels   = g->bitmap.buffer;          // FT owns; valid until next load
-    out->pitch    = g->bitmap.pitch;
-    return out->pitch >= 0;                    // (negative-pitch bitmaps unsupported)
+    out->advance = (float)g->advance.x / 64.0f;
+    out->pixels = g->bitmap.buffer;
+    out->pitch = g->bitmap.pitch;
+    return true;
 }
 
 void Prim32RasterFreeFT(FontAtlas* fa) {

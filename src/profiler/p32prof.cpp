@@ -241,6 +241,9 @@ static struct { float t, ram, vram; } s_drift[256];
 static int s_driftN = 0, s_driftHead = 0;
 static ULONGLONG s_lastKU = 0;
 static uint64_t  s_lastPageFaults = 0;
+static volatile LONG s_sampleState = 0;  // 0 idle, 1 sampling, 2 ready
+static ProcStats s_sampleResult;
+static uint64_t  s_sampleResultQpc = 0;
 
 // PDH loaded dynamically: no hard dependency, survives localized systems.
 typedef PDH_STATUS (WINAPI* PdhOpenQueryW_t)(LPCWSTR, DWORD_PTR, PDH_HQUERY*);
@@ -253,6 +256,7 @@ static PdhCollect_t   s_pdhCollect;
 static PdhGetArrayW_t s_pdhGetArray;
 static bool           s_pdhInit = false, s_pdhOk = false;
 static char           s_otherEngine[24] = "?";
+static char           s_sampleOtherEngine[24] = "?";
 const char* OtherEngineName() { return s_otherEngine; }
 
 static void PdhInit() {
@@ -274,8 +278,8 @@ static void PdhInit() {
     s_pdhOk = true;
 }
 
-static void PdhSample() {
-    s_ps.gpuValid = false;
+static void PdhSample(ProcStats& ps) {
+    ps.gpuValid = false;
     if (!s_pdhInit) PdhInit();
     if (!s_pdhOk) return;
     if (s_pdhCollect(s_pdhQuery) != ERROR_SUCCESS) return;
@@ -304,25 +308,24 @@ static void PdhSample() {
                 const wchar_t* src = et ? et : nm;
                 int k = 0;
                 for (; k < 23 && src[k] && src[k] != L'_'; k++)
-                    s_otherEngine[k] = src[k] < 128 ? (char)src[k] : '?';
-                s_otherEngine[k] = 0;
+                    s_sampleOtherEngine[k] = src[k] < 128 ? (char)src[k] : '?';
+                s_sampleOtherEngine[k] = 0;
             }
         }
     }
-    s_ps.gpu3D = e3d; s_ps.gpuCopy = ecp; s_ps.gpuCompute = ecm;
-    s_ps.gpuVideo = evd; s_ps.gpuOther = eot;
-    s_ps.gpuValid = true;
+    ps.gpu3D = e3d; ps.gpuCopy = ecp; ps.gpuCompute = ecm;
+    ps.gpuVideo = evd; ps.gpuOther = eot;
+    ps.gpuValid = true;
 }
 
-void SampleProcess() {
-    InitOnce();
+static void CALLBACK SampleProcessWorker(PTP_CALLBACK_INSTANCE, void*) {
+    ProcStats ps = s_sampleResult;
     uint64_t now = Qpc();
-    if (s_lastSampleQpc && (now - s_lastSampleQpc) / s_qpf < 0.5) return;
     double dt = s_lastSampleQpc ? (now - s_lastSampleQpc) / s_qpf : 0;
     s_lastSampleQpc = now;
 
     SYSTEM_INFO si; GetSystemInfo(&si);
-    s_ps.cores = (int)si.dwNumberOfProcessors;
+    ps.cores = (int)si.dwNumberOfProcessors;
 
     FILETIME ct, et, kt, ut;
     if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
@@ -331,24 +334,25 @@ void SampleProcess() {
         ULONGLONG ku = k + u;                              // 100ns units
         if (dt > 0 && s_lastKU) {
             double busySec = (ku - s_lastKU) * 1e-7;
-            s_ps.cpuCorePct  = (float)(busySec / dt * 100.0);
-            s_ps.cpuTotalPct = s_ps.cpuCorePct / (s_ps.cores > 0 ? s_ps.cores : 1);
+            ps.cpuCorePct  = (float)(busySec / dt * 100.0);
+            ps.cpuTotalPct = ps.cpuCorePct / (ps.cores > 0 ? ps.cores : 1);
         }
         s_lastKU = ku;
     }
 
     PROCESS_MEMORY_COUNTERS_EX pmc = {}; pmc.cb = sizeof(pmc);
     if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
-        s_ps.wsMB     = pmc.WorkingSetSize     / (1024.0 * 1024.0);
-        s_ps.wsPeakMB = pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
-        s_ps.privMB   = pmc.PrivateUsage       / (1024.0 * 1024.0);
+        ps.wsMB     = pmc.WorkingSetSize     / (1024.0 * 1024.0);
+        ps.wsPeakMB = pmc.PeakWorkingSetSize / (1024.0 * 1024.0);
+        ps.privMB   = pmc.PrivateUsage       / (1024.0 * 1024.0);
         if (dt > 0 && s_lastPageFaults)
-            s_ps.pageFaultsPerSec = (float)((pmc.PageFaultCount - s_lastPageFaults) / dt);
+            ps.pageFaultsPerSec = (float)((pmc.PageFaultCount - s_lastPageFaults) / dt);
         s_lastPageFaults = pmc.PageFaultCount;
     }
 
-    DWORD hc = 0; GetProcessHandleCount(GetCurrentProcess(), &hc);
-    s_ps.handles = hc;
+    DWORD hc = 0;
+    if (GetProcessHandleCount(GetCurrentProcess(), &hc))
+        ps.handles = hc;
 
     uint32_t threads = 0;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -357,16 +361,44 @@ void SampleProcess() {
         DWORD pid = GetCurrentProcessId();
         if (Thread32First(snap, &te)) do { if (te.th32OwnerProcessID == pid) threads++; } while (Thread32Next(snap, &te));
         CloseHandle(snap);
+        ps.threads = threads;
     }
-    s_ps.threads = threads;
 
-    PdhSample();
+    PdhSample(ps);
+    s_sampleResult = ps;
+    s_sampleResultQpc = now;
+    InterlockedExchange(&s_sampleState, 2);
+}
 
-    // record drift sample
-    float tSec = (float)((now - s_qpc0) / s_qpf);
-    s_drift[s_driftHead] = { tSec, (float)s_ps.privMB, (float)s_ps.vramMB };
-    s_driftHead = (s_driftHead + 1) % 256;
-    if (s_driftN < 256) s_driftN++;
+void SampleProcess() {
+    InitOnce();
+
+    if (InterlockedCompareExchange(&s_sampleState, 2, 2) == 2) {
+        double vram = s_ps.vramMB, vramBudget = s_ps.vramBudgetMB;
+        double shared = s_ps.sharedMB, sharedBudget = s_ps.sharedBudgetMB;
+        bool vramValid = s_ps.vramValid;
+        s_ps = s_sampleResult;
+        s_ps.vramMB = vram; s_ps.vramBudgetMB = vramBudget;
+        s_ps.sharedMB = shared; s_ps.sharedBudgetMB = sharedBudget;
+        s_ps.vramValid = vramValid;
+        memcpy(s_otherEngine, s_sampleOtherEngine, sizeof(s_otherEngine));
+        InterlockedExchange(&s_sampleState, 0);
+
+        float tSec = (float)((s_sampleResultQpc - s_qpc0) / s_qpf);
+        s_drift[s_driftHead] = { tSec, (float)s_ps.privMB, (float)s_ps.vramMB };
+        s_driftHead = (s_driftHead + 1) % 256;
+        if (s_driftN < 256) s_driftN++;
+    }
+
+    uint64_t now = Qpc();
+    static uint64_t lastRequestQpc = 0;
+    if ((!lastRequestQpc || (now - lastRequestQpc) / s_qpf >= 0.5) &&
+        InterlockedCompareExchange(&s_sampleState, 1, 0) == 0) {
+        if (TrySubmitThreadpoolCallback(SampleProcessWorker, nullptr, nullptr))
+            lastRequestQpc = now;
+        else
+            InterlockedExchange(&s_sampleState, 0);
+    }
 }
 
 MemDrift GetMemDrift() {
